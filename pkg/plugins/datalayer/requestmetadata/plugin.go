@@ -45,15 +45,28 @@ func ExtractorFactory(name string, _ json.RawMessage, _ plugin.Handle) (plugin.P
 	return NewRequestMetadataExtractor(nil).WithName(name), nil
 }
 
-// RequestMetadataCount holds in-flight request and token counts for one model.
+// RequestMetadataCount holds in-flight request counts, in-flight max_tokens proxy totals,
+// and cumulative actual token usage for one model.
 type RequestMetadataCount struct {
-	Requests int64
-	Tokens   int64
+	Requests     int64
+	MaxTokens    int64
+	InputTokens  int64
+	OutputTokens int64
+	CachedTokens int64
+	ThinkTokens  int64
 }
 
 func (r RequestMetadataCount) Clone() datalayer.Cloneable { return r }
 
-// RequestMetadataExtractor tracks in-flight request counts and token sums per model.
+// standardizedUsage holds provider-normalized token counters for one response.
+type standardizedUsage struct {
+	InputTokens  int64
+	OutputTokens int64
+	CachedTokens int64
+	ThinkTokens  int64
+}
+
+// RequestMetadataExtractor tracks in-flight request counts and cumulative actual token usage per model.
 // It writes RequestMetadataCount to each model's RequestMetadataAttributeKey attribute.
 //
 // Extract is assumed to be called from a single goroutine (the NotificationSource event loop).
@@ -98,10 +111,11 @@ func (e *RequestMetadataExtractor) Extract(_ context.Context, events []dlsrc.Eve
 			if model == "" {
 				continue
 			}
-			maxTokens, _ := p.Request.Body["max_tokens"].(float64)
+			ensureStreamingUsageIncluded(p.Request.Body)
+			maxTokens := int64Value(p.Request.Body["max_tokens"])
 			c := e.counters[model]
 			c.Requests++
-			c.Tokens += int64(maxTokens)
+			c.MaxTokens += maxTokens
 			e.counters[model] = c
 			updated[model] = c
 
@@ -114,19 +128,110 @@ func (e *RequestMetadataExtractor) Extract(_ context.Context, events []dlsrc.Eve
 			if model == "" {
 				continue
 			}
-			maxTokens, _ := p.Request.Body["max_tokens"].(float64)
 			c := e.counters[model]
 			floorDecrement(&c.Requests, 1)
-			floorDecrement(&c.Tokens, int64(maxTokens))
+
+			maxTokens := int64Value(p.Request.Body["max_tokens"])
+			floorDecrement(&c.MaxTokens, maxTokens)
+
+			usage, ok := extractStandardizedUsage(p.Request.Body, p.Response.Body)
+			if ok {
+				c.InputTokens += usage.InputTokens
+				c.OutputTokens += usage.OutputTokens
+				c.CachedTokens += usage.CachedTokens
+				c.ThinkTokens += usage.ThinkTokens
+			}
+
 			e.counters[model] = c
 			updated[model] = c
 		}
 	}
 
-	for model, c := range updated {
-		e.ds.GetOrCreateModel(model).GetAttributes().Put(RequestMetadataAttributeKey, c)
+	if e.ds != nil {
+		for model, c := range updated {
+			e.ds.GetOrCreateModel(model).GetAttributes().Put(RequestMetadataAttributeKey, c)
+		}
 	}
 	return nil
+}
+
+// extractStandardizedUsage resolves the provider and extracts provider-normalized response usage.
+// Phase 1 supports conservative detection of OpenAI-compatible response bodies only, including
+// streamed final response chunks that carry a top-level usage object.
+// TODO: extend to other providers
+func extractStandardizedUsage(reqBody map[string]any, respBody map[string]any) (standardizedUsage, bool) {
+	if !isOpenAIRequest(reqBody, respBody) {
+		return standardizedUsage{}, false
+	}
+	return extractOpenAIUsage(respBody)
+}
+
+func isOpenAIRequest(reqBody map[string]any, respBody map[string]any) bool {
+	model, _ := reqBody["model"].(string)
+	if model == "" {
+		return false
+	}
+
+	usage, ok := respBody["usage"].(map[string]any)
+	if !ok {
+		return false
+	}
+
+	_, hasPromptTokens := usage["prompt_tokens"]
+	_, hasCompletionTokens := usage["completion_tokens"]
+	if !hasPromptTokens || !hasCompletionTokens {
+		return false
+	}
+
+	return true
+}
+
+func extractOpenAIUsage(body map[string]any) (standardizedUsage, bool) {
+	usage, ok := body["usage"].(map[string]any)
+	if !ok {
+		return standardizedUsage{}, false
+	}
+
+	result := standardizedUsage{
+		InputTokens:  int64Value(usage["prompt_tokens"]),
+		OutputTokens: int64Value(usage["completion_tokens"]),
+	}
+
+	if promptDetails, ok := usage["prompt_tokens_details"].(map[string]any); ok {
+		result.CachedTokens = int64Value(promptDetails["cached_tokens"])
+	}
+	if completionDetails, ok := usage["completion_tokens_details"].(map[string]any); ok {
+		result.ThinkTokens = int64Value(completionDetails["reasoning_tokens"])
+	}
+
+	return result, true
+}
+
+func ensureStreamingUsageIncluded(body map[string]any) {
+	stream, _ := body["stream"].(bool)
+	if !stream {
+		return
+	}
+
+	streamOptions, ok := body["stream_options"].(map[string]any)
+	if !ok {
+		streamOptions = map[string]any{}
+		body["stream_options"] = streamOptions
+	}
+	streamOptions["include_usage"] = true
+}
+
+func int64Value(v any) int64 {
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
 }
 
 // floorDecrement decrements v by delta, flooring at zero.
