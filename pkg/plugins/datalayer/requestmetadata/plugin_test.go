@@ -18,6 +18,7 @@ package requestmetadata
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -130,6 +131,9 @@ func TestRequestIncrementsInflightCounterOnly(t *testing.T) {
 	if rc.InputTokens != 0 || rc.OutputTokens != 0 || rc.CachedTokens != 0 || rc.ThinkTokens != 0 {
 		t.Errorf("expected zero cumulative token counts on request, got %+v", rc)
 	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts on request, got %+v", rc)
+	}
 }
 
 func TestStreamingRequestMutatesIncludeUsage(t *testing.T) {
@@ -181,6 +185,9 @@ func TestStreamingFinalChunkAccumulatesUsage(t *testing.T) {
 	if rc.InputTokens != 100 || rc.OutputTokens != 200 || rc.CachedTokens != 25 || rc.ThinkTokens != 75 {
 		t.Errorf("unexpected cumulative usage from streamed final chunk: %+v", rc)
 	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts, got %+v", rc)
+	}
 }
 
 func TestResponseDecrementsInflightAndAccumulatesUsage(t *testing.T) {
@@ -204,6 +211,9 @@ func TestResponseDecrementsInflightAndAccumulatesUsage(t *testing.T) {
 	if rc.InputTokens != 100 || rc.OutputTokens != 200 || rc.CachedTokens != 25 || rc.ThinkTokens != 75 {
 		t.Errorf("unexpected cumulative usage: %+v", rc)
 	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts, got %+v", rc)
+	}
 }
 
 func TestCounterFloorsAtZeroAndAccumulatesUsage(t *testing.T) {
@@ -225,6 +235,9 @@ func TestCounterFloorsAtZeroAndAccumulatesUsage(t *testing.T) {
 	}
 	if rc.InputTokens != 10 || rc.OutputTokens != 20 || rc.CachedTokens != 3 || rc.ThinkTokens != 4 {
 		t.Errorf("unexpected cumulative usage: %+v", rc)
+	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts, got %+v", rc)
 	}
 }
 
@@ -248,6 +261,9 @@ func TestResponseMissingUsageOnlyDecrementsInflight(t *testing.T) {
 	}
 	if rc.InputTokens != 0 || rc.OutputTokens != 0 || rc.CachedTokens != 0 || rc.ThinkTokens != 0 {
 		t.Errorf("expected zero cumulative usage without usage payload, got %+v", rc)
+	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts without usage payload, got %+v", rc)
 	}
 }
 
@@ -277,6 +293,9 @@ func TestResponseUsageWithoutOpenAIShapeDoesNotAccumulateUsage(t *testing.T) {
 	if rc.InputTokens != 0 || rc.OutputTokens != 0 || rc.CachedTokens != 0 || rc.ThinkTokens != 0 {
 		t.Errorf("expected zero cumulative usage for non-OpenAI-shaped usage payload, got %+v", rc)
 	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts for non-OpenAI-shaped usage payload, got %+v", rc)
+	}
 }
 
 func TestResponseMissingNestedUsageDetailsDefaultsToZero(t *testing.T) {
@@ -301,6 +320,9 @@ func TestResponseMissingNestedUsageDetailsDefaultsToZero(t *testing.T) {
 	if rc.InputTokens != 11 || rc.OutputTokens != 22 || rc.CachedTokens != 0 || rc.ThinkTokens != 0 {
 		t.Errorf("unexpected cumulative usage: %+v", rc)
 	}
+	if rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
+		t.Errorf("expected zero rollover counts, got %+v", rc)
+	}
 }
 
 func TestRequestMetadataMultipleModels(t *testing.T) {
@@ -317,12 +339,14 @@ func TestRequestMetadataMultipleModels(t *testing.T) {
 	}
 
 	rc1 := getRequestMetadata(t, ds, "m1")
-	if rc1.Requests != 0 || rc1.MaxTokens != 0 || rc1.InputTokens != 1 || rc1.OutputTokens != 2 || rc1.CachedTokens != 0 || rc1.ThinkTokens != 0 {
+	if rc1.Requests != 0 || rc1.MaxTokens != 0 || rc1.InputTokens != 1 || rc1.OutputTokens != 2 || rc1.CachedTokens != 0 || rc1.ThinkTokens != 0 ||
+		rc1.InputTokenRollovers != 0 || rc1.OutputTokenRollovers != 0 || rc1.CachedTokenRollovers != 0 || rc1.ThinkTokenRollovers != 0 {
 		t.Errorf("m1: unexpected metadata %+v", rc1)
 	}
 
 	rc2 := getRequestMetadata(t, ds, "m2")
-	if rc2.Requests != 0 || rc2.MaxTokens != 0 || rc2.InputTokens != 3 || rc2.OutputTokens != 4 || rc2.CachedTokens != 1 || rc2.ThinkTokens != 2 {
+	if rc2.Requests != 0 || rc2.MaxTokens != 0 || rc2.InputTokens != 3 || rc2.OutputTokens != 4 || rc2.CachedTokens != 1 || rc2.ThinkTokens != 2 ||
+		rc2.InputTokenRollovers != 0 || rc2.OutputTokenRollovers != 0 || rc2.CachedTokenRollovers != 0 || rc2.ThinkTokenRollovers != 0 {
 		t.Errorf("m2: unexpected metadata %+v", rc2)
 	}
 }
@@ -371,7 +395,36 @@ func TestExtractWithNilDatastoreDoesNotPanic(t *testing.T) {
 	}
 
 	rc := ext.counters["m1"]
-	if rc.Requests != 0 || rc.MaxTokens != 0 || rc.InputTokens != 10 || rc.OutputTokens != 20 || rc.CachedTokens != 3 || rc.ThinkTokens != 4 {
+	if rc.Requests != 0 || rc.MaxTokens != 0 || rc.InputTokens != 10 || rc.OutputTokens != 20 || rc.CachedTokens != 3 || rc.ThinkTokens != 4 ||
+		rc.InputTokenRollovers != 0 || rc.OutputTokenRollovers != 0 || rc.CachedTokenRollovers != 0 || rc.ThinkTokenRollovers != 0 {
 		t.Fatalf("unexpected in-memory counters with nil datastore: %+v", rc)
+	}
+}
+
+func TestAddWithRolloverNoOverflow(t *testing.T) {
+	var value int64 = 10
+	var rollovers int64
+
+	addWithRollover(&value, &rollovers, 5)
+
+	if value != 15 {
+		t.Fatalf("expected value=15, got %d", value)
+	}
+	if rollovers != 0 {
+		t.Fatalf("expected rollovers=0, got %d", rollovers)
+	}
+}
+
+func TestAddWithRolloverOverflow(t *testing.T) {
+	value := int64(math.MaxInt64 - 2)
+	var rollovers int64
+
+	addWithRollover(&value, &rollovers, 5)
+
+	if value != 2 {
+		t.Fatalf("expected wrapped value=2, got %d", value)
+	}
+	if rollovers != 1 {
+		t.Fatalf("expected rollovers=1, got %d", rollovers)
 	}
 }

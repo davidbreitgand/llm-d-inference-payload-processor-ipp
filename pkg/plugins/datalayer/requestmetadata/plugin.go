@@ -19,6 +19,7 @@ package requestmetadata
 import (
 	"context"
 	"encoding/json"
+	"math"
 
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/datastore"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/datalayer"
@@ -46,14 +47,18 @@ func ExtractorFactory(name string, _ json.RawMessage, _ plugin.Handle) (plugin.P
 }
 
 // RequestMetadataCount holds in-flight request counts, in-flight max_tokens proxy totals,
-// and cumulative actual token usage for one model.
+// cumulative actual token usage for one model, and rollover counts for the cumulative token fields.
 type RequestMetadataCount struct {
-	Requests     int64
-	MaxTokens    int64
-	InputTokens  int64
-	OutputTokens int64
-	CachedTokens int64
-	ThinkTokens  int64
+	Requests             int64
+	MaxTokens            int64
+	InputTokens          int64
+	InputTokenRollovers  int64
+	OutputTokens         int64
+	OutputTokenRollovers int64
+	CachedTokens         int64
+	CachedTokenRollovers int64
+	ThinkTokens          int64
+	ThinkTokenRollovers  int64
 }
 
 func (r RequestMetadataCount) Clone() datalayer.Cloneable { return r }
@@ -136,10 +141,10 @@ func (e *RequestMetadataExtractor) Extract(_ context.Context, events []dlsrc.Eve
 
 			usage, ok := extractStandardizedUsage(p.Request.Body, p.Response.Body)
 			if ok {
-				c.InputTokens += usage.InputTokens
-				c.OutputTokens += usage.OutputTokens
-				c.CachedTokens += usage.CachedTokens
-				c.ThinkTokens += usage.ThinkTokens
+				addWithRollover(&c.InputTokens, &c.InputTokenRollovers, usage.InputTokens)
+				addWithRollover(&c.OutputTokens, &c.OutputTokenRollovers, usage.OutputTokens)
+				addWithRollover(&c.CachedTokens, &c.CachedTokenRollovers, usage.CachedTokens)
+				addWithRollover(&c.ThinkTokens, &c.ThinkTokenRollovers, usage.ThinkTokens)
 			}
 
 			e.counters[model] = c
@@ -240,4 +245,18 @@ func floorDecrement(v *int64, delta int64) {
 	if *v < 0 {
 		*v = 0
 	}
+}
+
+// addWithRollover adds delta to v, incrementing rollovers if necessary.
+// addWithRollover behavior is modulo-int64 accumulation with explicit overflow counting.
+func addWithRollover(v *int64, rollovers *int64, delta int64) {
+	if delta <= 0 {
+		return
+	}
+	if *v > math.MaxInt64-delta {
+		*rollovers++
+		*v = delta - (math.MaxInt64 - *v) - 1
+		return
+	}
+	*v += delta
 }
