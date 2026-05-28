@@ -22,13 +22,13 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	healthPb "google.golang.org/grpc/health/grpc_health_v1"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -38,7 +38,9 @@ import (
 	logutil "github.com/llm-d/llm-d-inference-payload-processor/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/common/observability/profiling"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/common/observability/tracing"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/config/loader"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/datastore/inmemory"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/plugin"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/requesthandling"
 	notificationsource "github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/plugins/datalayer/notificationsource"
@@ -53,8 +55,6 @@ import (
 	runserver "github.com/llm-d/llm-d-inference-payload-processor/pkg/server"
 	"github.com/llm-d/llm-d-inference-payload-processor/version"
 )
-
-const modelField = "model"
 
 var setupLog = ctrl.Log.WithName("setup")
 
@@ -178,54 +178,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 
 	ds := inmemory.NewDatastore()
-	handle := plugin.NewHandle(ctx, mgr, ds)
 
-	// Register factories for all known in-tree plugins
-	r.registerInTreePlugins()
-
-	// Construct plugin instances for the in-tree plugins that are (1) registered and (2) requested via the --plugin flags
-	if len(opts.PluginSpecs) == 0 {
-		setupLog.Info("no plugins are specified. Running with the default plugins")
-
-		modelToHeaderPlugin, err := bodyfieldtoheader.NewBodyFieldToHeaderPlugin(modelField, bodyfieldtoheader.ModelHeader)
-		if err != nil {
-			setupLog.Error(err, "failed to create plugin", "pluginType", bodyfieldtoheader.BodyFieldToHeaderPluginType)
-			return err
-		}
-		r.requestPlugins = append(r.requestPlugins, modelToHeaderPlugin)
-
-		// Create BaseModelToHeaderPlugin instance for extracting the "model" field into X-Gateway-Base-Model-Name
-		baseModelToHeaderPlugin, err := basemodelextractor.NewBaseModelToHeaderPlugin(func() *builder.Builder {
-			return ctrl.NewControllerManagedBy(mgr)
-		}, mgr.GetClient())
-		if err != nil {
-			setupLog.Error(err, "failed to create plugin", "pluginType", basemodelextractor.BaseModelToHeaderPluginType)
-			return err
-		}
-
-		r.requestPlugins = append(r.requestPlugins, baseModelToHeaderPlugin)
-	} else {
-		setupLog.Info("plugins are specified, running with the specified plugins.")
-
-		for _, s := range opts.PluginSpecs {
-			factory, ok := plugin.Registry[s.Type]
-			if !ok {
-				err := fmt.Errorf("unknown plugin type %q (no factory registered)", s.Type)
-				setupLog.Error(err, "Failed to find plugin factory", "pluginType", s.Type)
-				return err
-			}
-			instance, err := factory(s.Name, s.JSON, handle)
-			if err != nil {
-				setupLog.Error(err, fmt.Sprintf("invalid %s#%s: %v\n", s.Type, s.Name, err))
-				return err
-			}
-			if requestProcessor, ok := instance.(requesthandling.RequestProcessor); ok {
-				r.requestPlugins = append(r.requestPlugins, requestProcessor)
-			}
-			if responseProcessor, ok := instance.(requesthandling.ResponseProcessor); ok {
-				r.responsePlugins = append(r.responsePlugins, responseProcessor)
-			}
-		}
+	err = r.loadConfiguration(ctx, opts, mgr, ds, setupLog)
+	if err != nil {
+		return err
 	}
 
 	// Wire the request-metadata data pipeline: extractor → notification source.
@@ -267,6 +223,41 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	setupLog.Info("manager terminated")
 	return nil
+}
+
+func (r *Runner) loadConfiguration(ctx context.Context, opts *runserver.Options, mgr manager.Manager, ds datalayer.Datastore, logger logr.Logger) error {
+	handle := plugin.NewHandle(ctx, mgr, ds)
+
+	var configBytes []byte
+	if opts.ConfigText != "" {
+		configBytes = []byte(opts.ConfigText)
+	} else if opts.ConfigFile != "" { // if config was specified through a file
+		var err error
+		configBytes, err = os.ReadFile(opts.ConfigFile)
+		if err != nil {
+			logger.Error(err, "failed to load config from a file", "file", opts.ConfigFile)
+			return fmt.Errorf("failed to load config from a file '%s' - %w", opts.ConfigFile, err)
+		}
+	}
+
+	// Register factories for all known in-tree plugins
+	r.registerInTreePlugins()
+
+	theConfig, err := loader.LoadConfiguration(configBytes, handle, logger)
+	if err == nil {
+		// Hack for now until the ProfilePicker is supported
+		var profileName = ""
+		for name := range theConfig.Profiles {
+			profileName = name
+			break
+		}
+		logger.Info("Running with", "profile", profileName)
+
+		r.requestPlugins = theConfig.Profiles[profileName].RequestPlugins
+		r.responsePlugins = theConfig.Profiles[profileName].ResponsePlugins
+	}
+
+	return err
 }
 
 // registerInTreePlugins registers the factory functions of all known payload processor plugins
