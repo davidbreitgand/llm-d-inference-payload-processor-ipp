@@ -40,6 +40,9 @@ const TokenPricesAttributeKey = "token_prices"
 // ModelPriceShape is the on-disk pricing block: prices in USD per 1,000,000 tokens.
 // It is the JSON DTO consumed by configuration loaders and is NOT stored on the
 // Model directly — convert to a *TokenPrices via ToTokenPrices first.
+// ModelPriceShape and its reciprocal TokenPrices are intentionally minimalistic.
+// A more elaborate struct might be introduced in the future
+// to reflect caching, batching, volume, tiering, etc. discounts
 type ModelPriceShape struct {
 	InputPerMillion  float64 `json:"input_per_million"`
 	OutputPerMillion float64 `json:"output_per_million"`

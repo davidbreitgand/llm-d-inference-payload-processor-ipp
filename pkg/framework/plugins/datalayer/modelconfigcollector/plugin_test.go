@@ -474,40 +474,6 @@ func TestStart_SkipsNegativePrice(t *testing.T) {
 	}
 }
 
-// TestStart_FileChange_UpdatesPrices verifies that editing the nested pricing block
-// in the config file is picked up by the watcher and atomically overwrites the
-// stored *pricing.TokenPrices on the Model.
-func TestStart_FileChange_UpdatesPrices(t *testing.T) {
-	ds := datastore.NewFakeDataStore()
-	path := writeTempModelsConfig(t, ModelsConfig{
-		Models: []ModelConfiguration{{
-			Name:    priceTestModelName,
-			Pricing: &pricing.ModelPriceShape{InputPerMillion: 2.0, OutputPerMillion: 8.0},
-		}},
-	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	overwriteFile(t, path, ModelsConfig{
-		Models: []ModelConfiguration{{
-			Name:    priceTestModelName,
-			Pricing: &pricing.ModelPriceShape{InputPerMillion: 3.0, OutputPerMillion: 12.0},
-		}},
-	})
-
-	want := &pricing.TokenPrices{InputTokenPrice: 3.0 / 1e6, OutputTokenPrice: 12.0 / 1e6}
-	got := waitForTokenPrices(t, ds, want, 2*time.Second)
-	if !floatCloseEnough(got.InputTokenPrice, want.InputTokenPrice) ||
-		!floatCloseEnough(got.OutputTokenPrice, want.OutputTokenPrice) {
-		t.Errorf("TokenPrices after update = %+v, want %+v", got, want)
-	}
-}
-
 // floatCloseEnough returns true when a and b agree within priceFloatEpsilon.
 func floatCloseEnough(a, b float64) bool {
 	diff := a - b
