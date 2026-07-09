@@ -60,14 +60,10 @@ func (p *TokenPrices) Clone() datalayer.Cloneable {
 	return &TokenPrices{InputTokenPrice: p.InputTokenPrice, OutputTokenPrice: p.OutputTokenPrice}
 }
 
-// ToTokenPrices converts a *ModelPriceShape (per-million-tokens DTO) into the
-// in-memory *TokenPrices (per-token). A nil shape means "no pricing supplied"
-// and produces a free model (both fields 0). Centralizing the absent / empty /
-// explicit-zero handling here keeps the free-model invariant in one place.
-func ToTokenPrices(s *ModelPriceShape) *TokenPrices {
-	if s == nil {
-		return &TokenPrices{}
-	}
+// ToTokenPrices converts a ModelPriceShape (per-million-tokens DTO) into the
+// in-memory *TokenPrices (per-token). A zero-valued shape produces a free model
+// (both fields 0).
+func ToTokenPrices(s ModelPriceShape) *TokenPrices {
 	return &TokenPrices{
 		InputTokenPrice:  s.InputPerMillion / 1e6,
 		OutputTokenPrice: s.OutputPerMillion / 1e6,

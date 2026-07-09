@@ -372,7 +372,7 @@ func TestStart_PopulatesPrices(t *testing.T) {
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{{
 			Name:    priceTestModelName,
-			Pricing: &pricing.ModelPriceShape{InputPerMillion: 2.0, OutputPerMillion: 8.0},
+			Pricing: pricing.ModelPriceShape{InputPerMillion: 2.0, OutputPerMillion: 8.0},
 		}},
 	})
 	c := useFactory(t, path, ds)
@@ -455,9 +455,9 @@ func TestStart_SkipsNegativePrice(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{
-			{Name: "bad-input", Pricing: &pricing.ModelPriceShape{InputPerMillion: -1.0}},
-			{Name: "bad-output", Pricing: &pricing.ModelPriceShape{OutputPerMillion: -1.0}},
-			{Name: "ok", Pricing: &pricing.ModelPriceShape{InputPerMillion: 1.0, OutputPerMillion: 2.0}},
+			{Name: "bad-input", Pricing: pricing.ModelPriceShape{InputPerMillion: -1.0}},
+			{Name: "bad-output", Pricing: pricing.ModelPriceShape{OutputPerMillion: -1.0}},
+			{Name: "ok", Pricing: pricing.ModelPriceShape{InputPerMillion: 1.0, OutputPerMillion: 2.0}},
 		},
 	})
 	c := useFactory(t, path, ds)

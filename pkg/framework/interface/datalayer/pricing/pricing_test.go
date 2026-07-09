@@ -40,15 +40,15 @@ func TestTokenPricesClone(t *testing.T) {
 	}
 }
 
-// TestToTokenPrices_Nil verifies that a nil *ModelPriceShape produces a zero-valued
-// TokenPrices ("free model"), which is the invariant downstream consumers rely on
-// when an operator omits the pricing block from a model entry.
-func TestToTokenPrices_Nil(t *testing.T) {
-	tp := ToTokenPrices(nil)
+// TestToTokenPrices_ZeroValue verifies that a zero-valued ModelPriceShape produces
+// a zero-valued TokenPrices ("free model"), which is the invariant downstream consumers
+// rely on when an operator omits the pricing block from a model entry.
+func TestToTokenPrices_ZeroValue(t *testing.T) {
+	tp := ToTokenPrices(ModelPriceShape{})
 	if tp == nil {
-		t.Fatal("ToTokenPrices(nil) returned nil; want zero-valued *TokenPrices")
+		t.Fatal("ToTokenPrices(ModelPriceShape{}) returned nil; want zero-valued *TokenPrices")
 	}
 	if tp.InputTokenPrice != 0 || tp.OutputTokenPrice != 0 {
-		t.Errorf("ToTokenPrices(nil) = %+v, want {0, 0}", tp)
+		t.Errorf("ToTokenPrices(ModelPriceShape{}) = %+v, want {0, 0}", tp)
 	}
 }
