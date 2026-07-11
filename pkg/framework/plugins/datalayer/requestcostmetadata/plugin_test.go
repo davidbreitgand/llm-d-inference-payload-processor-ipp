@@ -78,15 +78,15 @@ func setTokenPrices(ds datalayer.Datastore, model string, in, out float64) {
 	)
 }
 
-// readDigest fetches the *accumulator.CostDigest for model from ds,
-// returning nil if the attribute is absent or of the wrong type.
-func readDigest(ds datalayer.Datastore, model string) *accumulator.CostDigest {
+// readDigest fetches the *accumulator.CostDigest for model from ds, returning
+// (digest, true) if present and well-typed, or (nil, false) otherwise.
+func readDigest(ds datalayer.Datastore, model string) (*accumulator.CostDigest, bool) {
 	v, ok := ds.GetOrCreateModel(model).GetAttributes().Get(accumulator.CostDigestAttributeKey)
 	if !ok {
-		return nil
+		return nil, false
 	}
-	cd, _ := v.(*accumulator.CostDigest)
-	return cd
+	cd, ok := v.(*accumulator.CostDigest)
+	return cd, ok
 }
 
 // newTestExtractor builds an extractor with flushInterval=0 so every event
@@ -95,7 +95,8 @@ func readDigest(ds datalayer.Datastore, model string) *accumulator.CostDigest {
 func newTestExtractor(t *testing.T) (*RequestCostMetadataExtractor, datalayer.Datastore) {
 	t.Helper()
 	ds := datastore.NewFakeDataStore()
-	ext := NewRequestCostMetadataExtractor(ds, defaultCompression, 0)
+	ext := NewRequestCostMetadataExtractor(ds)
+	ext.flushInterval = 0
 	return ext, ds
 }
 
@@ -111,7 +112,7 @@ func TestExtractorFactory_HonorsConfig(t *testing.T) {
 	}
 	ext := p.(*RequestCostMetadataExtractor)
 	if ext.compression != 50 {
-		t.Errorf("compression = %f, want 50", ext.compression)
+		t.Errorf("compression = %v, want 50", ext.compression)
 	}
 	if ext.flushInterval != time.Minute {
 		t.Errorf("flushInterval = %v, want 1m", ext.flushInterval)
@@ -150,8 +151,8 @@ func TestExtract_PublishesCostDigest(t *testing.T) {
 		t.Fatalf("Extract: %v", err)
 	}
 
-	cd := readDigest(ds, "m1")
-	if cd == nil {
+	cd, ok := readDigest(ds, "m1")
+	if !ok {
 		t.Fatal("expected CostDigest attribute to be present")
 	}
 	if cd.Digest.Count() != 1 {
@@ -161,7 +162,7 @@ func TestExtract_PublishesCostDigest(t *testing.T) {
 	// the digest's median should equal the inserted value.
 	wantCost := 100.0*1e-6 + 50.0*4e-6
 	if got := cd.Digest.Quantile(0.5); got != wantCost {
-		t.Errorf("Quantile(0.5) = %f, want %f", got, wantCost)
+		t.Errorf("Quantile(0.5) = %v, want %v", got, wantCost)
 	}
 }
 
@@ -175,7 +176,7 @@ func TestExtract_SkipsEmptyModel(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if readDigest(ds, "") != nil {
+	if _, ok := readDigest(ds, ""); ok {
 		t.Error("expected no CostDigest attribute for empty model string")
 	}
 }
@@ -198,7 +199,7 @@ func TestExtract_SkipsNonStringModel(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if readDigest(ds, "m1") != nil {
+	if _, ok := readDigest(ds, "m1"); ok {
 		t.Error("expected no CostDigest attribute for non-string model type")
 	}
 }
@@ -216,7 +217,7 @@ func TestExtract_SkipsRequestEvents(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if readDigest(ds, "m1") != nil {
+	if _, ok := readDigest(ds, "m1"); ok {
 		t.Error("expected no CostDigest attribute after request-only batch")
 	}
 }
@@ -231,7 +232,7 @@ func TestExtract_SkipsMissingUsage(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if readDigest(ds, "m1") != nil {
+	if _, ok := readDigest(ds, "m1"); ok {
 		t.Error("expected no CostDigest attribute after missing-usage batch")
 	}
 }
@@ -265,7 +266,7 @@ func TestExtract_SkipsNonPositiveTokens(t *testing.T) {
 			if err := ext.Extract(context.Background(), []dlsrc.Event{tc.ev}); err != nil {
 				t.Fatalf("Extract: %v", err)
 			}
-			if readDigest(ds, "m1") != nil {
+			if _, ok := readDigest(ds, "m1"); ok {
 				t.Errorf("expected no CostDigest attribute for %s", tc.name)
 			}
 		})
@@ -283,7 +284,7 @@ func TestExtract_SkipsMissingPricing(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if readDigest(ds, "m1") != nil {
+	if _, ok := readDigest(ds, "m1"); ok {
 		t.Error("expected no CostDigest attribute for model without pricing")
 	}
 }
@@ -300,7 +301,7 @@ func TestExtract_EmptyBatch(t *testing.T) {
 	}
 
 	// No digest should be published
-	if readDigest(ds, "m1") != nil {
+	if _, ok := readDigest(ds, "m1"); ok {
 		t.Error("expected no CostDigest after empty batch")
 	}
 }
@@ -322,8 +323,8 @@ func TestExtract_MultipleModels(t *testing.T) {
 	}
 
 	// m1 should have 2 samples (ev1 + ev3)
-	cd1 := readDigest(ds, "m1")
-	if cd1 == nil {
+	cd1, ok1 := readDigest(ds, "m1")
+	if !ok1 {
 		t.Fatal("expected CostDigest for m1")
 	}
 	if cd1.Digest.Count() != 2 {
@@ -331,8 +332,8 @@ func TestExtract_MultipleModels(t *testing.T) {
 	}
 
 	// m2 should have 1 sample (ev2)
-	cd2 := readDigest(ds, "m2")
-	if cd2 == nil {
+	cd2, ok2 := readDigest(ds, "m2")
+	if !ok2 {
 		t.Fatal("expected CostDigest for m2")
 	}
 	if cd2.Digest.Count() != 1 {
@@ -343,7 +344,7 @@ func TestExtract_MultipleModels(t *testing.T) {
 	// With 2 samples [2e-4, 2.5e-4], median should be between them
 	q1 := cd1.Digest.Quantile(0.5)
 	if q1 < 2e-4 || q1 > 2.5e-4 {
-		t.Errorf("m1 Quantile(0.5) = %f, want between 2e-4 and 2.5e-4", q1)
+		t.Errorf("m1 Quantile(0.5) = %v, want between 2e-4 and 2.5e-4", q1)
 	}
 
 	// Verify m2's quantile is the single sample (with floating-point tolerance)
@@ -351,7 +352,7 @@ func TestExtract_MultipleModels(t *testing.T) {
 	q2 := cd2.Digest.Quantile(0.5)
 	tolerance := 1e-10
 	if diff := q2 - wantCost2; diff < -tolerance || diff > tolerance {
-		t.Errorf("m2 Quantile(0.5) = %f, want %f", q2, wantCost2)
+		t.Errorf("m2 Quantile(0.5) = %v, want %v", q2, wantCost2)
 	}
 }
 
@@ -360,7 +361,8 @@ func TestExtract_MultipleModels(t *testing.T) {
 func TestExtract_FlushIntervalGating(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	// Create an extractor with a 10ms flush interval (short for testing)
-	ext := NewRequestCostMetadataExtractor(ds, defaultCompression, 10*time.Millisecond)
+	ext := NewRequestCostMetadataExtractor(ds)
+	ext.flushInterval = 10 * time.Millisecond
 	setTokenPrices(ds, "m1", 1e-6, 1e-6)
 
 	// First event: should not publish (first lastFlush is now, no interval elapsed)
@@ -368,7 +370,7 @@ func TestExtract_FlushIntervalGating(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev1}); err != nil {
 		t.Fatalf("Extract 1: %v", err)
 	}
-	if readDigest(ds, "m1") != nil {
+	if _, ok := readDigest(ds, "m1"); ok {
 		t.Error("expected no CostDigest after first event (before interval)")
 	}
 
@@ -380,8 +382,8 @@ func TestExtract_FlushIntervalGating(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev2}); err != nil {
 		t.Fatalf("Extract 2: %v", err)
 	}
-	cd := readDigest(ds, "m1")
-	if cd == nil {
+	cd, ok := readDigest(ds, "m1")
+	if !ok {
 		t.Fatal("expected CostDigest after interval elapsed")
 	}
 	// After publishing, the snapshot is a clone of the internal digest

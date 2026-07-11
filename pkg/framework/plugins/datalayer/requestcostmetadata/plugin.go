@@ -89,8 +89,10 @@ func ExtractorFactory(name string, parameters json.RawMessage, h plugin.Handle) 
 		return nil, fmt.Errorf("invalid flushIntervalDuration %q for plugin %q: must be >= 0", config.FlushIntervalDuration, name)
 	}
 
-	ext := NewRequestCostMetadataExtractor(h.Datastore(), config.Compression, flushInterval)
+	ext := NewRequestCostMetadataExtractor(h.Datastore())
 	ext.typedName.Name = name
+	ext.compression = config.Compression
+	ext.flushInterval = flushInterval
 	return ext, nil
 }
 
@@ -117,14 +119,14 @@ type RequestCostMetadataExtractor struct {
 }
 
 // NewRequestCostMetadataExtractor constructs an extractor wired to ds with
-// the specified compression and flush interval.
-func NewRequestCostMetadataExtractor(ds datalayer.Datastore, compression float64, flushInterval time.Duration) *RequestCostMetadataExtractor {
+// proposal-default compression and flush interval.
+func NewRequestCostMetadataExtractor(ds datalayer.Datastore) *RequestCostMetadataExtractor {
 	return &RequestCostMetadataExtractor{
 		typedName:     plugin.TypedName{Type: PluginType, Name: PluginType},
 		ds:            ds,
 		state:         make(map[string]*modelCostAccumulator),
-		compression:   compression,
-		flushInterval: flushInterval,
+		compression:   defaultCompression,
+		flushInterval: defaultFlushIntervalDuration,
 	}
 }
 
@@ -138,7 +140,7 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 	debugLogger := log.FromContext(ctx).V(logutil.DEBUG)
 
 	now := time.Now()
-	updated := make(map[string]*modelCostAccumulator)
+	updated := map[string]bool{}
 	// Cache token prices per-model to avoid repeated lookups within this batch
 	tokenPricesCache := make(map[string]*pricing.TokenPrices)
 
@@ -166,6 +168,12 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 			continue
 		}
 
+		promptTokens, completionTokens, ok := extractTokenCounts(p)
+		if !ok {
+			debugLogger.Info("response missing usable usage fields, skipping", "model", model)
+			continue
+		}
+
 		// Check cache first; only lookup if not already cached
 		tp, ok := tokenPricesCache[model]
 		if !ok {
@@ -183,12 +191,6 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 			continue
 		}
 
-		promptTokens, completionTokens, ok := extractTokenCounts(p)
-		if !ok {
-			debugLogger.Info("response missing usable usage fields, skipping", "model", model)
-			continue
-		}
-
 		cost := promptTokens*tp.InputTokenPrice + completionTokens*tp.OutputTokenPrice
 
 		acc, err := e.getOrCreateAccumulator(model, now)
@@ -200,12 +202,17 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 			debugLogger.Info("tdigest.Add returned an unexpected error, skipping sample", "model", model, "err", err)
 			continue
 		}
-		updated[model] = acc
+		updated[model] = true
 	}
 
 	// After extracting all valid samples, iterate over models that were updated
 	// in this batch to decide which ones to flush.
-	for model, acc := range updated {
+	for model := range updated {
+		acc, err := e.getOrCreateAccumulator(model, now)
+		if err != nil {
+			debugLogger.Info("failed to create tdigest accumulator", "model", model, "err", err)
+			continue
+		}
 		// flushInterval == 0 means publish on every event
 		if e.flushInterval > 0 && now.Sub(acc.lastFlush) < e.flushInterval {
 			continue
