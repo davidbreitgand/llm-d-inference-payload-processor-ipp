@@ -78,15 +78,15 @@ func setTokenPrices(ds datalayer.Datastore, model string, in, out float64) {
 	)
 }
 
-// readDigest fetches the *accumulator.CostDigest for model from ds, returning
-// (digest, true) if present and well-typed, or (nil, false) otherwise.
-func readDigest(ds datalayer.Datastore, model string) (*accumulator.CostDigest, bool) {
+// readDigest fetches the *accumulator.CostDigest for model from ds,
+// returning nil if the attribute is absent or of the wrong type.
+func readDigest(ds datalayer.Datastore, model string) *accumulator.CostDigest {
 	v, ok := ds.GetOrCreateModel(model).GetAttributes().Get(accumulator.CostDigestAttributeKey)
 	if !ok {
-		return nil, false
+		return nil
 	}
-	cd, ok := v.(*accumulator.CostDigest)
-	return cd, ok
+	cd, _ := v.(*accumulator.CostDigest)
+	return cd
 }
 
 // newTestExtractor builds an extractor with flushInterval=0 so every event
@@ -150,8 +150,8 @@ func TestExtract_PublishesCostDigest(t *testing.T) {
 		t.Fatalf("Extract: %v", err)
 	}
 
-	cd, ok := readDigest(ds, "m1")
-	if !ok {
+	cd := readDigest(ds, "m1")
+	if cd == nil {
 		t.Fatal("expected CostDigest attribute to be present")
 	}
 	if cd.Digest.Count() != 1 {
@@ -175,7 +175,7 @@ func TestExtract_SkipsEmptyModel(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if _, ok := readDigest(ds, ""); ok {
+	if readDigest(ds, "") != nil {
 		t.Error("expected no CostDigest attribute for empty model string")
 	}
 }
@@ -198,7 +198,7 @@ func TestExtract_SkipsNonStringModel(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if _, ok := readDigest(ds, "m1"); ok {
+	if readDigest(ds, "m1") != nil {
 		t.Error("expected no CostDigest attribute for non-string model type")
 	}
 }
@@ -216,7 +216,7 @@ func TestExtract_SkipsRequestEvents(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if _, ok := readDigest(ds, "m1"); ok {
+	if readDigest(ds, "m1") != nil {
 		t.Error("expected no CostDigest attribute after request-only batch")
 	}
 }
@@ -231,7 +231,7 @@ func TestExtract_SkipsMissingUsage(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if _, ok := readDigest(ds, "m1"); ok {
+	if readDigest(ds, "m1") != nil {
 		t.Error("expected no CostDigest attribute after missing-usage batch")
 	}
 }
@@ -265,7 +265,7 @@ func TestExtract_SkipsNonPositiveTokens(t *testing.T) {
 			if err := ext.Extract(context.Background(), []dlsrc.Event{tc.ev}); err != nil {
 				t.Fatalf("Extract: %v", err)
 			}
-			if _, ok := readDigest(ds, "m1"); ok {
+			if readDigest(ds, "m1") != nil {
 				t.Errorf("expected no CostDigest attribute for %s", tc.name)
 			}
 		})
@@ -283,7 +283,7 @@ func TestExtract_SkipsMissingPricing(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev}); err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
-	if _, ok := readDigest(ds, "m1"); ok {
+	if readDigest(ds, "m1") != nil {
 		t.Error("expected no CostDigest attribute for model without pricing")
 	}
 }
@@ -300,7 +300,7 @@ func TestExtract_EmptyBatch(t *testing.T) {
 	}
 
 	// No digest should be published
-	if _, ok := readDigest(ds, "m1"); ok {
+	if readDigest(ds, "m1") != nil {
 		t.Error("expected no CostDigest after empty batch")
 	}
 }
@@ -322,8 +322,8 @@ func TestExtract_MultipleModels(t *testing.T) {
 	}
 
 	// m1 should have 2 samples (ev1 + ev3)
-	cd1, ok1 := readDigest(ds, "m1")
-	if !ok1 {
+	cd1 := readDigest(ds, "m1")
+	if cd1 == nil {
 		t.Fatal("expected CostDigest for m1")
 	}
 	if cd1.Digest.Count() != 2 {
@@ -331,8 +331,8 @@ func TestExtract_MultipleModels(t *testing.T) {
 	}
 
 	// m2 should have 1 sample (ev2)
-	cd2, ok2 := readDigest(ds, "m2")
-	if !ok2 {
+	cd2 := readDigest(ds, "m2")
+	if cd2 == nil {
 		t.Fatal("expected CostDigest for m2")
 	}
 	if cd2.Digest.Count() != 1 {
@@ -368,7 +368,7 @@ func TestExtract_FlushIntervalGating(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev1}); err != nil {
 		t.Fatalf("Extract 1: %v", err)
 	}
-	if _, ok := readDigest(ds, "m1"); ok {
+	if readDigest(ds, "m1") != nil {
 		t.Error("expected no CostDigest after first event (before interval)")
 	}
 
@@ -380,8 +380,8 @@ func TestExtract_FlushIntervalGating(t *testing.T) {
 	if err := ext.Extract(context.Background(), []dlsrc.Event{ev2}); err != nil {
 		t.Fatalf("Extract 2: %v", err)
 	}
-	cd, ok := readDigest(ds, "m1")
-	if !ok {
+	cd := readDigest(ds, "m1")
+	if cd == nil {
 		t.Fatal("expected CostDigest after interval elapsed")
 	}
 	// After publishing, the snapshot is a clone of the internal digest
