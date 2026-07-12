@@ -111,7 +111,7 @@ func TestExtractorFactory_HonorsConfig(t *testing.T) {
 	}
 	ext := p.(*RequestCostMetadataExtractor)
 	if ext.compression != 50 {
-		t.Errorf("compression = %v, want 50", ext.compression)
+		t.Errorf("compression = %f, want 50", ext.compression)
 	}
 	if ext.flushInterval != time.Minute {
 		t.Errorf("flushInterval = %v, want 1m", ext.flushInterval)
@@ -161,7 +161,7 @@ func TestExtract_PublishesCostDigest(t *testing.T) {
 	// the digest's median should equal the inserted value.
 	wantCost := 100.0*1e-6 + 50.0*4e-6
 	if got := cd.Digest.Quantile(0.5); got != wantCost {
-		t.Errorf("Quantile(0.5) = %v, want %v", got, wantCost)
+		t.Errorf("Quantile(0.5) = %f, want %f", got, wantCost)
 	}
 }
 
@@ -343,7 +343,7 @@ func TestExtract_MultipleModels(t *testing.T) {
 	// With 2 samples [2e-4, 2.5e-4], median should be between them
 	q1 := cd1.Digest.Quantile(0.5)
 	if q1 < 2e-4 || q1 > 2.5e-4 {
-		t.Errorf("m1 Quantile(0.5) = %v, want between 2e-4 and 2.5e-4", q1)
+		t.Errorf("m1 Quantile(0.5) = %f, want between 2e-4 and 2.5e-4", q1)
 	}
 
 	// Verify m2's quantile is the single sample (with floating-point tolerance)
@@ -351,7 +351,7 @@ func TestExtract_MultipleModels(t *testing.T) {
 	q2 := cd2.Digest.Quantile(0.5)
 	tolerance := 1e-10
 	if diff := q2 - wantCost2; diff < -tolerance || diff > tolerance {
-		t.Errorf("m2 Quantile(0.5) = %v, want %v", q2, wantCost2)
+		t.Errorf("m2 Quantile(0.5) = %f, want %f", q2, wantCost2)
 	}
 }
 
