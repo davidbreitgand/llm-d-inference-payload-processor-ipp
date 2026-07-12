@@ -166,12 +166,6 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 			continue
 		}
 
-		promptTokens, completionTokens, ok := extractTokenCounts(p)
-		if !ok {
-			debugLogger.Info("response missing usable usage fields, skipping", "model", model)
-			continue
-		}
-
 		// Check cache first; only lookup if not already cached
 		tp, ok := tokenPricesCache[model]
 		if !ok {
@@ -186,6 +180,12 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 
 		if tp == nil {
 			debugLogger.Info("TokenPrices is nil, skipping cost sample", "model", model)
+			continue
+		}
+
+		promptTokens, completionTokens, ok := extractTokenCounts(p)
+		if !ok {
+			debugLogger.Info("response missing usable usage fields, skipping", "model", model)
 			continue
 		}
 
