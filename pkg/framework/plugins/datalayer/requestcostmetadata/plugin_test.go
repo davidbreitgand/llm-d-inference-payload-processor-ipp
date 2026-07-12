@@ -95,8 +95,7 @@ func readDigest(ds datalayer.Datastore, model string) (*accumulator.CostDigest, 
 func newTestExtractor(t *testing.T) (*RequestCostMetadataExtractor, datalayer.Datastore) {
 	t.Helper()
 	ds := datastore.NewFakeDataStore()
-	ext := NewRequestCostMetadataExtractor(ds)
-	ext.flushInterval = 0
+	ext := NewRequestCostMetadataExtractor(ds, defaultCompression, 0)
 	return ext, ds
 }
 
@@ -361,8 +360,7 @@ func TestExtract_MultipleModels(t *testing.T) {
 func TestExtract_FlushIntervalGating(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	// Create an extractor with a 10ms flush interval (short for testing)
-	ext := NewRequestCostMetadataExtractor(ds)
-	ext.flushInterval = 10 * time.Millisecond
+	ext := NewRequestCostMetadataExtractor(ds, defaultCompression, 10*time.Millisecond)
 	setTokenPrices(ds, "m1", 1e-6, 1e-6)
 
 	// First event: should not publish (first lastFlush is now, no interval elapsed)

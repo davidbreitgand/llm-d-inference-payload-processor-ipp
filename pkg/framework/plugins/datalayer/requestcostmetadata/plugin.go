@@ -89,10 +89,8 @@ func ExtractorFactory(name string, parameters json.RawMessage, h plugin.Handle) 
 		return nil, fmt.Errorf("invalid flushIntervalDuration %q for plugin %q: must be >= 0", config.FlushIntervalDuration, name)
 	}
 
-	ext := NewRequestCostMetadataExtractor(h.Datastore())
+	ext := NewRequestCostMetadataExtractor(h.Datastore(), config.Compression, flushInterval)
 	ext.typedName.Name = name
-	ext.compression = config.Compression
-	ext.flushInterval = flushInterval
 	return ext, nil
 }
 
@@ -119,14 +117,14 @@ type RequestCostMetadataExtractor struct {
 }
 
 // NewRequestCostMetadataExtractor constructs an extractor wired to ds with
-// proposal-default compression and flush interval.
-func NewRequestCostMetadataExtractor(ds datalayer.Datastore) *RequestCostMetadataExtractor {
+// the specified compression and flush interval.
+func NewRequestCostMetadataExtractor(ds datalayer.Datastore, compression float64, flushInterval time.Duration) *RequestCostMetadataExtractor {
 	return &RequestCostMetadataExtractor{
 		typedName:     plugin.TypedName{Type: PluginType, Name: PluginType},
 		ds:            ds,
 		state:         make(map[string]*modelCostAccumulator),
-		compression:   defaultCompression,
-		flushInterval: defaultFlushIntervalDuration,
+		compression:   compression,
+		flushInterval: flushInterval,
 	}
 }
 
