@@ -138,7 +138,7 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 	debugLogger := log.FromContext(ctx).V(logutil.DEBUG)
 
 	now := time.Now()
-	updated := map[string]bool{}
+	updated := make(map[string]*modelCostAccumulator)
 	// Cache token prices per-model to avoid repeated lookups within this batch
 	tokenPricesCache := make(map[string]*pricing.TokenPrices)
 
@@ -200,17 +200,12 @@ func (e *RequestCostMetadataExtractor) Extract(ctx context.Context, events []dls
 			debugLogger.Info("tdigest.Add returned an unexpected error, skipping sample", "model", model, "err", err)
 			continue
 		}
-		updated[model] = true
+		updated[model] = acc
 	}
 
 	// After extracting all valid samples, iterate over models that were updated
 	// in this batch to decide which ones to flush.
-	for model := range updated {
-		acc, err := e.getOrCreateAccumulator(model, now)
-		if err != nil {
-			debugLogger.Info("failed to create tdigest accumulator", "model", model, "err", err)
-			continue
-		}
+	for model, acc := range updated {
 		// flushInterval == 0 means publish on every event
 		if e.flushInterval > 0 && now.Sub(acc.lastFlush) < e.flushInterval {
 			continue
