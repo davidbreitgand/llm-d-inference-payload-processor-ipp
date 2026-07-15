@@ -24,7 +24,7 @@ For each model, CostGuard maintains a [t-digest](https://github.com/tdunning/t-d
 $$rank = TrimmedMean(0, \alpha) + \lambda \cdot CTE(\alpha)$$
 
 - **TrimmedMean(0, $\alpha$)** — the mean of the bottom $\alpha$ fraction of observed costs (the body of the distribution).
-- **CTE($\alpha$)** — the Conditional Tail Expectation above the $\alpha$-quantile (the expected value of a draw from the tail).
+- **CTE($\alpha$)** — the Conditional Tail Expectation above the $\alpha$-quantile (the expected value of a draw from the tail). Computed on the per-model t-digest as `TrimmedMean(α, 1)`.
 - **$\alpha$** — the quantile that separates body from tail (e.g., 0.95 for the 95th percentile).
 - **$\lambda$** — a penalty weight on the tail contribution (default: 1).
 
@@ -70,14 +70,18 @@ CostGuard exposes five main knobs and two advanced knobs. All have sensible defa
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `epsilon` | float, [0, 1] | `0.1` | Probability of random exploration on each request. Setting it to `1.0` forces full random behavior (with replacement). |
-| `alpha` | float, [0, 1] | `0.95` | Quantile that separates the body of the cost distribution from the tail. For example, `0.95` means the top 5 % of observed costs are treated as the tail. |
+| `alpha` | float, (0, 1) | `0.95` | Quantile that separates the body of the cost distribution from the tail. For example, `0.95` means the top 5 % of observed costs are treated as the tail. |
 | `lambda` | float, >= 0 | `1.0` | Penalty weight applied to the tail cost (CTE). Increase the penalty to penalise models with expensive outlier responses more aggressively. |
-| `windowDuration` | duration string | `"2h"` | Length of each epoch. The t-digest is reset at the end of each window. |
-| `w` | float, [0, 1] | `0.03` | This is quantile margin of error. The true $\alpha$-percentile of the cost distribution of the model is between $[X - w, X + w]$. In other words, if $\alpha = 0.95$ and $w = 0.03$, then at a $95\%$ confidence level, the true percentile `95` lies between `P92` and `P98` of the *observed* values. Always calculated at the $95\%$ confidence level. |
+| `windowDuration` | duration string, > 0 | `"2h"` | Length of each epoch. The t-digest is reset at the end of each window. |
+| `percentileMarginError` | float, (0, 1) | `0.03` | Quantile margin of error. The true $\alpha$-percentile of the cost distribution of the model is between $[X - \text{percentileMarginError}, X + \text{percentileMarginError}]$. In other words, if $\alpha = 0.95$ and $\text{percentileMarginError} = 0.03$, then at a $95\%$ confidence level, the true percentile `95` lies between `P92` and `P98` of the *observed* values. Always calculated at the $95\%$ confidence level. |
 
-The scorer automatically determines the minimal number of samples required for exploring the model given the above parameters. A user should be careful in setting `w` and `windowDuration`.
+The scorer automatically determines the minimal number of samples required for exploring the model given the above parameters. A user should be careful in setting `percentileMarginError` and `windowDuration`.
 
-Making the `w` too small will require too many observations to explore a model, because the number of observations is inversely proportional to the square of `w`. In the above example, around `200` observations are required.
+Making `percentileMarginError` too small will require too many observations to explore a model, because the number of observations is inversely proportional to the square of `percentileMarginError`. Concretely, the minimum sample count is derived from the Wald confidence interval for a proportion:
+
+$$n = \left\lceil \frac{z_{95}^2 \cdot \alpha \cdot (1 - \alpha)}{\text{percentileMarginError}^2} \right\rceil$$
+
+where $z_{95} = 1.96$ is the standard normal quantile for a two-sided $95\%$ confidence interval. In the above example ($\alpha = 0.95$, $\text{percentileMarginError} = 0.03$), this gives around `200` observations.
 
 Making the `windowDuration`. Too short or too long might hurt the quality of scoring.
 
