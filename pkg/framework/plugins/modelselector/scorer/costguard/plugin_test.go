@@ -95,7 +95,7 @@ func TestFactory_ValidationErrors(t *testing.T) {
 		{"lambda negative", `{"lambda":-0.1}`},
 		{"pme zero", `{"percentileMarginError":0}`},
 		{"pme one", `{"percentileMarginError":1}`},
-		{"windowDuration unparseable", `{"windowDuration":"not-a-duration"}`},
+		{"windowDuration unparsable", `{"windowDuration":"not-a-duration"}`},
 		{"windowDuration zero", `{"windowDuration":"0s"}`},
 		{"windowDuration negative", `{"windowDuration":"-1s"}`},
 	}
