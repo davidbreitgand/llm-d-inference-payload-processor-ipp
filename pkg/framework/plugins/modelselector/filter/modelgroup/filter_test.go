@@ -18,19 +18,26 @@ package modelgroup
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 	"testing"
 
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/modelgroups"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/requesthandling"
 )
 
-// candidateModels builds the datalayer models handed to the filter.
-func candidateModels(names ...string) []datalayer.Model {
+// candidateModels builds the datalayer models handed to the filter. membership
+// optionally maps a model name to the group names it belongs to (mirroring what
+// the model-config-datasource plugin would have written to the model's
+// AttributeMap); a model name absent from membership has no groups attribute.
+func candidateModels(membership map[string][]string, names ...string) []datalayer.Model {
 	models := make([]datalayer.Model, len(names))
 	for idx, name := range names {
-		models[idx] = datalayer.NewModel(name)
+		m := datalayer.NewModel(name)
+		if groups, ok := membership[name]; ok {
+			m.GetAttributes().Put(modelgroups.GroupsAttributeKey, modelgroups.Groups(groups))
+		}
+		models[idx] = m
 	}
 	return models
 }
@@ -56,11 +63,11 @@ func requestWithModel(value any) *requesthandling.InferenceRequest {
 	return r
 }
 
-// TestModelGroupFilterFactory verifies that the factory parses parameters
-// correctly and carries the right type and instance name.
+// TestModelGroupFilterFactory verifies that the factory (which takes no
+// parameters — group membership comes from the datalayer, not plugin config)
+// carries the right type and instance name.
 func TestModelGroupFilterFactory(t *testing.T) {
-	params := json.RawMessage(`{"qwen3models": ["qwen3-8b", "qwen3-32b"]}`)
-	p, err := ModelGroupFilterFactory("my-filter", params, nil)
+	p, err := ModelGroupFilterFactory("my-filter", nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -73,34 +80,13 @@ func TestModelGroupFilterFactory(t *testing.T) {
 	}
 }
 
-// TestModelGroupFilterFactory_InvalidJSON verifies that malformed parameters
-// cause the factory to return an error.
-func TestModelGroupFilterFactory_InvalidJSON(t *testing.T) {
-	_, err := ModelGroupFilterFactory("f", json.RawMessage(`{invalid`), nil)
-	if err == nil {
-		t.Fatal("expected error for invalid JSON params, got nil")
-	}
-}
-
-// TestModelGroupFilterFactory_EmptyParams verifies that an empty/nil params
-// payload creates a filter with no groups (pass-all on "auto").
-func TestModelGroupFilterFactory_EmptyParams(t *testing.T) {
-	p, err := ModelGroupFilterFactory("f", nil, nil)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if p == nil {
-		t.Fatal("expected non-nil plugin")
-	}
-}
-
 // TestModelGroupFilter_NoGroupsConfigured verifies filtering behavior when no
-// groups are configured at all: an "auto/<group-name>" selector always fails
-// (there is nothing to match), while an explicit, available model name still
-// succeeds via the exact-match path.
+// candidate model carries any group attribute: an "auto/<group-name>" selector
+// always fails (there is nothing to match), while an explicit, available model
+// name still succeeds via the exact-match path.
 func TestModelGroupFilter_NoGroupsConfigured(t *testing.T) {
-	f := NewModelGroupFilter(nil)
-	candidates := candidateModels("qwen3-8b", "qwen3-32b")
+	f := NewModelGroupFilter()
+	candidates := candidateModels(nil, "qwen3-8b", "qwen3-32b")
 
 	t.Run("auto/somegroup fails with no groups defined", func(t *testing.T) {
 		req := requestWithModel("auto/somegroup")
@@ -120,41 +106,16 @@ func TestModelGroupFilter_NoGroupsConfigured(t *testing.T) {
 	})
 }
 
-// TestNewModelGroupFilter_SkipsInvalidGroups verifies that groups with an
-// empty name, an empty model list, or an empty model name in the list are
-// skipped, while valid groups configured alongside them still load.
-func TestNewModelGroupFilter_SkipsInvalidGroups(t *testing.T) {
-	groups := map[string][]string{
-		"valid":        {"qwen3-8b", "qwen3-32b"},
-		"":             {"llama3-8b"},
-		"empty-models": {},
-		"blank-model":  {"llama3-8b", ""},
-	}
-
-	f := NewModelGroupFilter(groups)
-
-	if _, ok := f.groups["valid"]; !ok {
-		t.Error("expected valid group to be loaded")
-	}
-	if _, ok := f.groups[""]; ok {
-		t.Error("expected group with empty name to be skipped")
-	}
-	if _, ok := f.groups["empty-models"]; ok {
-		t.Error("expected group with empty model list to be skipped")
-	}
-	if _, ok := f.groups["blank-model"]; ok {
-		t.Error("expected group with a blank model name to be skipped")
-	}
-	if len(f.groups) != 1 {
-		t.Errorf("expected exactly 1 loaded group, got %d", len(f.groups))
-	}
-}
-
 // TestModelGroupFilter_Filter covers all behavioural cases described in the README.
+// Group membership is now attached directly to each candidate model's
+// modelgroups.GroupsAttributeKey attribute (as the model-config-datasource plugin
+// would populate it), rather than passed as filter constructor parameters.
 func TestModelGroupFilter_Filter(t *testing.T) {
-	groups := map[string][]string{
-		"qwen3models": {"qwen3-8b", "qwen3-32b"},
-		"llama3":      {"llama3-8b", "llama3-70b"},
+	membership := map[string][]string{
+		"qwen3-8b":   {"qwen3models"},
+		"qwen3-32b":  {"qwen3models"},
+		"llama3-8b":  {"llama3"},
+		"llama3-70b": {"llama3"},
 	}
 	// All models available in the data layer.
 	all := []string{"qwen3-8b", "qwen3-32b", "llama3-8b", "llama3-70b", "mistral-7b"}
@@ -236,10 +197,10 @@ func TestModelGroupFilter_Filter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := NewModelGroupFilter(groups)
+			f := NewModelGroupFilter()
 			req := requestWithModel(tt.modelBody)
 
-			got := modelNames(f.Filter(context.Background(), nil, req, candidateModels(all...)))
+			got := modelNames(f.Filter(context.Background(), nil, req, candidateModels(membership, all...)))
 			want := append([]string{}, tt.want...)
 			sort.Strings(want)
 
@@ -260,13 +221,10 @@ func TestModelGroupFilter_Filter(t *testing.T) {
 // requested group is known but none of its models appear in the candidate
 // list, the filter returns no candidates.
 func TestModelGroupFilter_GroupModelsNotInCandidates(t *testing.T) {
-	groups := map[string][]string{
-		"qwen3models": {"qwen3-8b", "qwen3-32b"},
-	}
 	// Candidate set excludes every model in the qwen3models group.
-	candidates := candidateModels("mistral-7b")
+	candidates := candidateModels(nil, "mistral-7b")
 
-	f := NewModelGroupFilter(groups)
+	f := NewModelGroupFilter()
 	req := requestWithModel("auto/qwen3models")
 
 	got := modelNames(f.Filter(context.Background(), nil, req, candidates))
@@ -276,16 +234,17 @@ func TestModelGroupFilter_GroupModelsNotInCandidates(t *testing.T) {
 }
 
 // TestModelGroupFilter_PartialGroupInCandidates verifies that when only a
-// subset of the group's models are present in the candidate list, only those
+// subset of a group's models are present in the candidate list, only those
 // present are returned.
 func TestModelGroupFilter_PartialGroupInCandidates(t *testing.T) {
-	groups := map[string][]string{
-		"qwen3models": {"qwen3-8b", "qwen3-32b", "qwen3-72b"},
+	membership := map[string][]string{
+		"qwen3-8b":  {"qwen3models"},
+		"qwen3-72b": {"qwen3models"},
 	}
 	// Only qwen3-8b and qwen3-72b are in the data layer; qwen3-32b is absent.
-	candidates := candidateModels("qwen3-8b", "qwen3-72b", "mistral-7b")
+	candidates := candidateModels(membership, "qwen3-8b", "qwen3-72b", "mistral-7b")
 
-	f := NewModelGroupFilter(groups)
+	f := NewModelGroupFilter()
 	req := requestWithModel("auto/qwen3models")
 
 	got := modelNames(f.Filter(context.Background(), nil, req, candidates))
@@ -298,6 +257,25 @@ func TestModelGroupFilter_PartialGroupInCandidates(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("Filter() = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestModelGroupFilter_ModelInMultipleGroups verifies that a model carrying
+// more than one group in its attribute matches on any of them.
+func TestModelGroupFilter_ModelInMultipleGroups(t *testing.T) {
+	membership := map[string][]string{
+		"qwen3-32b": {"qwen3models", "large-models"},
+	}
+	candidates := candidateModels(membership, "qwen3-32b")
+
+	f := NewModelGroupFilter()
+
+	for _, group := range []string{"qwen3models", "large-models"} {
+		req := requestWithModel("auto/" + group)
+		got := modelNames(f.Filter(context.Background(), nil, req, candidates))
+		if len(got) != 1 || got[0] != "qwen3-32b" {
+			t.Errorf("Filter() for group %q = %v, want [qwen3-32b]", group, got)
 		}
 	}
 }

@@ -25,13 +25,13 @@ package modelgroup
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	logutil "github.com/llm-d/llm-d-inference-payload-processor/pkg/common/observability/logging"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/modelgroups"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/modelselector"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/plugin"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/requesthandling"
@@ -55,65 +55,27 @@ const (
 // compile-time type validation
 var _ modelselector.Filter = &ModelGroupFilter{}
 
-// ModelGroupFilterFactory parses the plugin parameters as a map of group name →
-// model names and returns a configured ModelGroupFilter.
-func ModelGroupFilterFactory(name string, params json.RawMessage, _ plugin.Handle) (plugin.Plugin, error) {
-	groups := map[string][]string{}
-	if len(params) > 0 {
-		if err := json.Unmarshal(params, &groups); err != nil {
-			return nil, err
-		}
-	}
-	return NewModelGroupFilter(groups).WithName(name), nil
+// ModelGroupFilterFactory returns a configured ModelGroupFilter. The filter takes
+// no parameters: group membership is resolved at filter time from each candidate
+// model's modelgroups.GroupsAttributeKey attribute, populated by the
+// model-config-datasource plugin from the shared config file's "groups" list.
+func ModelGroupFilterFactory(name string, _ json.RawMessage, _ plugin.Handle) (plugin.Plugin, error) {
+	return NewModelGroupFilter().WithName(name), nil
 }
 
-// NewModelGroupFilter initializes a new ModelGroupFilter with the given groups map.
-// A group is skipped (not added) if its name is empty, its model list is empty,
-// or any model name in the list is empty; a warning is logged for each skipped group.
-func NewModelGroupFilter(groups map[string][]string) *ModelGroupFilter {
-	// Build a set-per-group for O(1) membership tests.
-	groupSets := make(map[string]map[string]struct{}, len(groups))
-	for groupName, models := range groups {
-		if err := validateGroup(groupName, models); err != nil {
-			log.Log.Error(nil, "model-group filter: skipping invalid group configuration", "group", groupName, "models", models, "reason", err.Error())
-			continue
-		}
-		set := make(map[string]struct{}, len(models))
-		for _, m := range models {
-			set[m] = struct{}{}
-		}
-		groupSets[groupName] = set
-	}
+// NewModelGroupFilter initializes a new ModelGroupFilter.
+func NewModelGroupFilter() *ModelGroupFilter {
 	return &ModelGroupFilter{
 		typedName: plugin.TypedName{Type: ModelGroupFilterType, Name: ModelGroupFilterType},
-		groups:    groupSets,
 	}
-}
-
-// validateGroup checks that groupName is non-empty and that models is a
-// non-empty list of non-empty model names.
-func validateGroup(groupName string, models []string) error {
-	if groupName == "" {
-		return errors.New("group name must be a non-empty string")
-	}
-	if len(models) == 0 {
-		return errors.New("group must list at least one model")
-	}
-	for _, m := range models {
-		if m == "" {
-			return errors.New("group model names must be non-empty strings")
-		}
-	}
-	return nil
 }
 
 // ModelGroupFilter restricts the candidate models based on the request body's
 // "model" field: an exact model name, "auto"/absent/empty for all candidates,
-// or "auto/<group-name>" for the models belonging to a configured group.
+// or "auto/<group-name>" for the candidates whose modelgroups.GroupsAttributeKey
+// attribute lists that group name.
 type ModelGroupFilter struct {
 	typedName plugin.TypedName
-	// groups maps group name → set of model names belonging to that group.
-	groups map[string]map[string]struct{}
 }
 
 // TypedName returns the type and name tuple of this plugin instance.
@@ -167,21 +129,19 @@ func (f *ModelGroupFilter) Filter(ctx context.Context, _ *plugin.CycleState, req
 		return []datalayer.Model{}
 	}
 
-	groupSet, exists := f.groups[groupName]
-	if !exists {
-		logger.V(logutil.VERBOSE).Info("unknown group in auto-group selector, no candidates", "group", groupName)
-		return []datalayer.Model{}
-	}
-
 	var result []datalayer.Model
 	for _, m := range models {
-		if _, inGroup := groupSet[m.GetName()]; inGroup {
+		groups, ok := m.GetAttributes().Get(modelgroups.GroupsAttributeKey)
+		if !ok {
+			continue
+		}
+		if g, ok := groups.(modelgroups.Groups); ok && g.Contains(groupName) {
 			result = append(result, m)
 		}
 	}
 
 	if len(result) == 0 {
-		logger.V(logutil.VERBOSE).Info("no candidates match the auto-group", "group", groupName)
+		logger.V(logutil.VERBOSE).Info("unknown group or no candidates match the auto-group", "group", groupName)
 		return []datalayer.Model{}
 	}
 

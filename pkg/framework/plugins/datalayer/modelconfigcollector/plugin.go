@@ -29,6 +29,7 @@ import (
 
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
 	dlsrc "github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/datasource"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/modelgroups"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/pricing"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/plugin"
 )
@@ -54,9 +55,17 @@ type ModelConfiguration struct {
 	Pricing pricing.ModelPriceShape `json:"pricing"`
 }
 
+// ModelGroupConfig is a named group of model names in the config file. It is
+// used to populate each listed model's modelgroups.GroupsAttributeKey attribute.
+type ModelGroupConfig struct {
+	Name   string   `json:"name"`
+	Models []string `json:"models"`
+}
+
 // ModelsConfig is the schema of the JSON config file.
 type ModelsConfig struct {
 	Models []ModelConfiguration `json:"models"`
+	Groups []ModelGroupConfig   `json:"groups,omitempty"`
 }
 
 // ModelConfigDataSource watches a JSON file listing model names and keeps the
@@ -176,7 +185,8 @@ func (c *ModelConfigDataSource) Stop() {
 }
 
 // syncModels reads the config file, registers every valid listed model in the datastore,
-// and removes any datastore model that no longer appears in the file.
+// removes any datastore model that no longer appears in the file, and (re)populates each
+// model's group membership from the config's group-centric "groups" list.
 func (c *ModelConfigDataSource) syncModels(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("model-config-datasource")
 
@@ -191,7 +201,32 @@ func (c *ModelConfigDataSource) syncModels(ctx context.Context) error {
 		return err
 	}
 
+	// membership maps a model name to the group names it belongs to, inverting the
+	// config's group-centric "groups" list ({name, models[]}) so it can be looked up
+	// per model below. Membership is only resolved against the "models" list once
+	// that loop below has run, so a group can reference a model before its validity
+	// as a model entry is known.
+	// A group with an empty name or an empty model list is invalid as the filter's
+	// "auto/<group-name>" syntax requires non-empty group-name.
+	// An individual empty model name within an otherwise valid group is
+	// skipped on its own.
+	membership := make(map[string]modelgroups.Groups)
+	for _, g := range cfg.Groups {
+		if g.Name == "" || len(g.Models) == 0 {
+			logger.Info("skipping invalid group configuration", "group", g.Name, "models", g.Models)
+			continue
+		}
+		for _, modelName := range g.Models {
+			if modelName == "" {
+				logger.Info("skipping empty model name in group configuration", "group", g.Name)
+				continue
+			}
+			membership[modelName] = append(membership[modelName], g.Name)
+		}
+	}
+
 	desired := make(map[string]struct{}, len(cfg.Models))
+	invalid := make(map[string]struct{}, len(cfg.Models))
 	for _, m := range cfg.Models {
 		if m.Name == "" {
 			logger.Info("skipping model entry with empty name")
@@ -202,11 +237,35 @@ func (c *ModelConfigDataSource) syncModels(ctx context.Context) error {
 				"model", m.Name,
 				"input_per_million", m.Pricing.InputPerMillion,
 				"output_per_million", m.Pricing.OutputPerMillion)
+			invalid[m.Name] = struct{}{}
 			continue
 		}
 		desired[m.Name] = struct{}{}
 		mdl := c.ds.GetOrCreateModel(m.Name)
 		mdl.GetAttributes().Put(pricing.TokenPricesAttributeKey, pricing.ToTokenPrices(m.Pricing))
+		// Refresh group membership alongside pricing so a model that lost all its
+		// group memberships in this reload doesn't keep a stale attribute.
+		if groups, ok := membership[m.Name]; ok {
+			mdl.GetAttributes().Put(modelgroups.GroupsAttributeKey, groups)
+		} else {
+			mdl.GetAttributes().Delete(modelgroups.GroupsAttributeKey)
+		}
+	}
+
+	// A group may reference a model name that isn't a valid "models" entry: either
+	// missing from "models" entirely, or present but itself skipped (empty name,
+	// negative price). Group membership never auto-creates a model, so just warn,
+	// distinguishing the two cases so the "invalid model" warning already logged
+	// above isn't mistaken for an unrelated "unknown model" one.
+	for modelName := range membership {
+		if _, ok := desired[modelName]; ok {
+			continue
+		}
+		if _, ok := invalid[modelName]; ok {
+			logger.Info("skipping invalid model referenced in group configuration", "model", modelName)
+		} else {
+			logger.Info("skipping unknown model in group configuration", "model", modelName)
+		}
 	}
 
 	for _, model := range c.ds.GetModels(datalayer.AllModelsPredicate) {

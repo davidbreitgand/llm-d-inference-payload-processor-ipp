@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/datastore"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/modelgroups"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/pricing"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/plugin"
 )
@@ -54,6 +56,18 @@ func useFactory(t *testing.T, path string, ds datalayer.Datastore) *ModelConfigD
 		t.Fatalf("DatasourceFactory: %v", err)
 	}
 	return p.(*ModelConfigDataSource)
+}
+
+// startFactory creates a datasource via useFactory, starts it, and registers a
+// cleanup that stops it. Fails the test if Start returns an error.
+func startFactory(t *testing.T, path string, ds datalayer.Datastore) {
+	t.Helper()
+	c := useFactory(t, path, ds)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() { cancel(); c.Stop() })
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 }
 
 func writeTempModelsConfig(t *testing.T, cfg ModelsConfig) string {
@@ -89,7 +103,10 @@ func overwriteFile(t *testing.T, path string, cfg ModelsConfig) {
 	}
 }
 
-func waitForModels(t *testing.T, ds datalayer.Datastore, wantCount int, timeout time.Duration) []datalayer.Model {
+// waitForUpdatedConfig polls until the datastore reflects wantCount models
+// (proving the fsnotify watcher picked up a file change and re-ran syncModels)
+// or the deadline expires.
+func waitForUpdatedConfig(t *testing.T, ds datalayer.Datastore, wantCount int, timeout time.Duration) []datalayer.Model {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -165,13 +182,7 @@ func TestStart_LoadsModels(t *testing.T) {
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{{Name: "m1"}, {Name: "m2"}},
 	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	models := ds.GetModels(datalayer.AllModelsPredicate)
 	if len(models) != 2 {
@@ -203,13 +214,7 @@ func TestStart_SkipsEmptyName(t *testing.T) {
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{{Name: ""}, {Name: "valid-model"}},
 	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	models := ds.GetModels(datalayer.AllModelsPredicate)
 	if len(models) != 1 || models[0].GetName() != "valid-model" {
@@ -226,13 +231,7 @@ func TestStart_RemovesStaleModels(t *testing.T) {
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{{Name: "current-model"}},
 	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	models := ds.GetModels(datalayer.AllModelsPredicate)
 	if len(models) != 1 || models[0].GetName() != "current-model" {
@@ -240,53 +239,52 @@ func TestStart_RemovesStaleModels(t *testing.T) {
 	}
 }
 
-// TestStart_FileChange_AddsModel verifies that writing a new model into the config file
-// after Start causes the watcher to pick up the change and register the new model.
-func TestStart_FileChange_AddsModel(t *testing.T) {
+// TestStart_WatcherTriggersResync verifies that writing to the config file after
+// Start causes the fsnotify watcher to invoke syncModels again. It is the sole
+// test of the watcher wiring itself; per-diff sync outcomes (add/remove/etc.)
+// are covered directly against syncModels in the TestSyncModels_FileChange_*
+// tests below, which don't need the watcher or polling.
+func TestStart_WatcherTriggersResync(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{{Name: "m1"}},
 	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	overwriteFile(t, path, ModelsConfig{
 		Models: []ModelConfiguration{{Name: "m1"}, {Name: "m2"}},
 	})
 
-	models := waitForModels(t, ds, 2, 2*time.Second)
+	models := waitForUpdatedConfig(t, ds, 2, 2*time.Second)
 	if len(models) != 2 {
 		t.Errorf("expected 2 models after file update, got %d: %v", len(models), models)
 	}
 }
 
-// TestStart_FileChange_RemovesModel verifies that removing a model from the config file
-// after Start causes the watcher to pick up the change and delete the model from the datastore.
-func TestStart_FileChange_RemovesModel(t *testing.T) {
+// TestSyncModels_FileChange_RemovesModel verifies that a second syncModels call,
+// after a model has been removed from the config file, deletes that model from
+// the datastore. Calls syncModels directly (no Start/watcher) since this is a
+// pure re-sync outcome, not a test of the watcher wiring.
+func TestSyncModels_FileChange_RemovesModel(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	path := writeTempModelsConfig(t, ModelsConfig{
 		Models: []ModelConfiguration{{Name: "m1"}, {Name: "m2"}},
 	})
 	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
+	if err := c.syncModels(context.Background()); err != nil {
+		t.Fatalf("syncModels: %v", err)
 	}
 
 	overwriteFile(t, path, ModelsConfig{
 		Models: []ModelConfiguration{{Name: "m1"}},
 	})
+	if err := c.syncModels(context.Background()); err != nil {
+		t.Fatalf("syncModels: %v", err)
+	}
 
-	models := waitForModels(t, ds, 1, 2*time.Second)
+	models := ds.GetModels(datalayer.AllModelsPredicate)
 	if len(models) != 1 || models[0].GetName() != "m1" {
-		t.Errorf("expected only [m1] after file update, got %v", models)
+		t.Errorf("expected only [m1] after resync, got %v", models)
 	}
 }
 
@@ -341,29 +339,6 @@ func readTokenPrices(t *testing.T, ds datalayer.Datastore) *pricing.TokenPrices 
 	return tp
 }
 
-// waitForTokenPrices polls until the *pricing.TokenPrices on priceTestModelName matches
-// want (both fields within priceFloatEpsilon) or the deadline expires. Returns the last
-// observed value (zero-valued *TokenPrices if nothing was ever observed).
-func waitForTokenPrices(t *testing.T, ds datalayer.Datastore, want *pricing.TokenPrices, timeout time.Duration) *pricing.TokenPrices {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	got := &pricing.TokenPrices{}
-	for time.Now().Before(deadline) {
-		v, ok := ds.GetOrCreateModel(priceTestModelName).GetAttributes().Get(pricing.TokenPricesAttributeKey)
-		if ok {
-			if tp, ok := v.(*pricing.TokenPrices); ok {
-				got = tp
-				if floatCloseEnough(got.InputTokenPrice, want.InputTokenPrice) &&
-					floatCloseEnough(got.OutputTokenPrice, want.OutputTokenPrice) {
-					return got
-				}
-			}
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return got
-}
-
 // TestStart_PopulatesPrices verifies that the per-million-tokens prices in the
 // config's nested "pricing" block are stored on the registered Model as per-token
 // prices (each field divided by 1e6) inside a single *pricing.TokenPrices attribute.
@@ -375,13 +350,7 @@ func TestStart_PopulatesPrices(t *testing.T) {
 			Pricing: pricing.ModelPriceShape{InputPerMillion: 2.0, OutputPerMillion: 8.0},
 		}},
 	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	tp := readTokenPrices(t, ds)
 	if !floatCloseEnough(tp.InputTokenPrice, 2.0/1e6) {
@@ -401,18 +370,7 @@ func TestStart_PopulatesPrices(t *testing.T) {
 func TestStart_OmittedPricingDefaultsToFreeModel(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	path := writeTempRaw(t, `{"models":[{"name":"m1"}]}`)
-	rawCfg, _ := json.Marshal(PluginConfig{ModelsPath: path})
-	p, err := DatasourceFactory("x", rawCfg, &fakeHandle{ds: ds})
-	if err != nil {
-		t.Fatalf("DatasourceFactory: %v", err)
-	}
-	c := p.(*ModelConfigDataSource)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	if models := ds.Models(); len(models) != 1 || models[0] != priceTestModelName {
 		t.Fatalf("expected exactly [%q] registered, got %v", priceTestModelName, models)
@@ -430,18 +388,7 @@ func TestStart_OmittedPricingDefaultsToFreeModel(t *testing.T) {
 func TestStart_PricingPresentButEmpty(t *testing.T) {
 	ds := datastore.NewFakeDataStore()
 	path := writeTempRaw(t, `{"models":[{"name":"m1","pricing":{}}]}`)
-	rawCfg, _ := json.Marshal(PluginConfig{ModelsPath: path})
-	p, err := DatasourceFactory("x", rawCfg, &fakeHandle{ds: ds})
-	if err != nil {
-		t.Fatalf("DatasourceFactory: %v", err)
-	}
-	c := p.(*ModelConfigDataSource)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	tp := readTokenPrices(t, ds)
 	if tp.InputTokenPrice != 0 || tp.OutputTokenPrice != 0 {
@@ -460,13 +407,7 @@ func TestStart_SkipsNegativePrice(t *testing.T) {
 			{Name: "ok", Pricing: pricing.ModelPriceShape{InputPerMillion: 1.0, OutputPerMillion: 2.0}},
 		},
 	})
-	c := useFactory(t, path, ds)
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() { cancel(); c.Stop() })
-
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
+	startFactory(t, path, ds)
 
 	models := ds.Models()
 	if len(models) != 1 || models[0] != "ok" {
@@ -481,4 +422,188 @@ func floatCloseEnough(a, b float64) bool {
 		diff = -diff
 	}
 	return diff < priceFloatEpsilon
+}
+
+// readGroups fetches the modelgroups.Groups stored on modelName, if any. It looks
+// the model up via GetModels rather than GetOrCreateModel so a name that was never
+// registered by syncModels is reported as "not found" rather than silently created.
+func readGroups(t *testing.T, ds datalayer.Datastore, modelName string) (modelgroups.Groups, bool) {
+	t.Helper()
+	matches := ds.GetModels(func(m datalayer.Model) bool { return m.GetName() == modelName })
+	if len(matches) == 0 {
+		return nil, false
+	}
+	v, ok := matches[0].GetAttributes().Get(modelgroups.GroupsAttributeKey)
+	if !ok {
+		return nil, false
+	}
+	g, ok := v.(modelgroups.Groups)
+	if !ok {
+		t.Fatalf("model %q: attribute %q is %T, want modelgroups.Groups", modelName, modelgroups.GroupsAttributeKey, v)
+	}
+	return g, true
+}
+
+// groupsEqual compares two Groups values order-insensitively. slices.Sort sorts
+// in place, so each input is cloned first to avoid mutating the caller's slice.
+func groupsEqual(a, b modelgroups.Groups) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	sortedA := slices.Clone(a)
+	sortedB := slices.Clone(b)
+	slices.Sort(sortedA)
+	slices.Sort(sortedB)
+	return slices.Compare(sortedA, sortedB) == 0
+}
+
+// --- Group-configuration tests ---
+
+// TestStart_GroupMembership verifies that the group-centric "groups" list in the
+// config file ({name, models[]}) is inverted into a per-model modelgroups.Groups
+// attribute on each referenced model, across a range of valid and invalid
+// group configurations.
+func TestStart_GroupMembership(t *testing.T) {
+	tests := []struct {
+		name       string
+		models     []ModelConfiguration
+		groups     []ModelGroupConfig
+		want       map[string]modelgroups.Groups // absent/empty means "expect no groups attribute"
+		wantModels []string                      // optional: asserts exactly these models are registered
+	}{
+		{
+			name: "multiple groups partition models",
+			models: []ModelConfiguration{
+				{Name: "qwen3-8b"}, {Name: "gpt-oss-20b"}, {Name: "gpt-oss-120b"}, {Name: "gemma4"},
+			},
+			groups: []ModelGroupConfig{
+				{Name: "fast", Models: []string{"qwen3-8b", "gpt-oss-20b"}},
+				{Name: "planning", Models: []string{"gpt-oss-120b", "gemma4"}},
+			},
+			want: map[string]modelgroups.Groups{
+				"qwen3-8b":     {"fast"},
+				"gpt-oss-20b":  {"fast"},
+				"gpt-oss-120b": {"planning"},
+				"gemma4":       {"planning"},
+			},
+		},
+		{
+			name:   "model in multiple groups",
+			models: []ModelConfiguration{{Name: "qwen3-32b"}},
+			groups: []ModelGroupConfig{
+				{Name: "qwen3models", Models: []string{"qwen3-32b"}},
+				{Name: "large-models", Models: []string{"qwen3-32b"}},
+			},
+			want: map[string]modelgroups.Groups{
+				"qwen3-32b": {"qwen3models", "large-models"},
+			},
+		},
+		{
+			name:   "group with empty models list is skipped, others still processed",
+			models: []ModelConfiguration{{Name: "m1"}, {Name: "m2"}},
+			groups: []ModelGroupConfig{
+				{Name: "empty-models", Models: []string{}},
+				{Name: "valid", Models: []string{"m2"}},
+			},
+			want: map[string]modelgroups.Groups{
+				"m1": nil,
+				"m2": {"valid"},
+			},
+		},
+		{
+			name:   "empty model name within a group is skipped, others still processed",
+			models: []ModelConfiguration{{Name: "m1"}, {Name: "m2"}},
+			groups: []ModelGroupConfig{
+				{Name: "mixed", Models: []string{"", "m2"}},
+			},
+			want: map[string]modelgroups.Groups{
+				"m1": nil,
+				"m2": {"mixed"},
+			},
+		},
+		{
+			name:   "group with empty name is skipped",
+			models: []ModelConfiguration{{Name: "m1"}, {Name: "m2"}},
+			groups: []ModelGroupConfig{
+				{Name: "", Models: []string{"m1"}},
+				{Name: "valid", Models: []string{"m2"}},
+			},
+			want: map[string]modelgroups.Groups{
+				"m1": nil,
+				"m2": {"valid"},
+			},
+		},
+		{
+			name:   "group referencing unknown model is skipped",
+			models: []ModelConfiguration{{Name: "known"}},
+			groups: []ModelGroupConfig{
+				{Name: "g1", Models: []string{"unknown-model"}},
+			},
+			want:       map[string]modelgroups.Groups{"known": nil},
+			wantModels: []string{"known"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := datastore.NewFakeDataStore()
+			path := writeTempModelsConfig(t, ModelsConfig{Models: tc.models, Groups: tc.groups})
+			startFactory(t, path, ds)
+
+			for modelName, want := range tc.want {
+				got, ok := readGroups(t, ds, modelName)
+				if len(want) == 0 {
+					if ok {
+						t.Errorf("model %q: expected no groups attribute, got %v", modelName, got)
+					}
+					continue
+				}
+				if !ok {
+					t.Errorf("model %q: expected groups attribute to be set", modelName)
+					continue
+				}
+				if !groupsEqual(got, want) {
+					t.Errorf("model %q: groups = %v, want %v", modelName, got, want)
+				}
+			}
+
+			if tc.wantModels != nil {
+				got := ds.Models()
+				if !groupsEqual(modelgroups.Groups(got), modelgroups.Groups(tc.wantModels)) {
+					t.Errorf("expected registered models %v, got %v", tc.wantModels, got)
+				}
+			}
+		})
+	}
+}
+
+// TestSyncModels_FileChange_GroupMembershipRemoved verifies that when a model's
+// group membership is dropped from the config file, a second syncModels call
+// clears its stale modelgroups.Groups attribute rather than leaving it in place.
+// Calls syncModels directly (no Start/watcher) since this is a pure re-sync
+// outcome, not a test of the watcher wiring.
+func TestSyncModels_FileChange_GroupMembershipRemoved(t *testing.T) {
+	ds := datastore.NewFakeDataStore()
+	path := writeTempModelsConfig(t, ModelsConfig{
+		Models: []ModelConfiguration{{Name: "m1"}},
+		Groups: []ModelGroupConfig{{Name: "g1", Models: []string{"m1"}}},
+	})
+	c := useFactory(t, path, ds)
+	if err := c.syncModels(context.Background()); err != nil {
+		t.Fatalf("syncModels: %v", err)
+	}
+	if _, ok := readGroups(t, ds, "m1"); !ok {
+		t.Fatal("expected m1 to have groups attribute set before file change")
+	}
+
+	overwriteFile(t, path, ModelsConfig{
+		Models: []ModelConfiguration{{Name: "m1"}},
+	})
+	if err := c.syncModels(context.Background()); err != nil {
+		t.Fatalf("syncModels: %v", err)
+	}
+
+	if _, ok := readGroups(t, ds, "m1"); ok {
+		t.Error("expected m1's groups attribute to be cleared after group removed from config")
+	}
 }
