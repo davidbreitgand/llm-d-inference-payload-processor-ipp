@@ -292,7 +292,7 @@ func stddevPop(ranks []float64) float64 {
 func lookupDigest(m datalayer.Model) *tdigest.TDigest, bool {
 	cd, err := datalayer.ReadAttributeKey[*accumulator.CostDigest](m.GetAttributes(), accumulator.CostDigestAttributeKey)
 	if err != nil {
-		return nil, false
+		return nil
 	}
-	return cd.Digest, true
+	return cd.Digest
 }
