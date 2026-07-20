@@ -281,13 +281,13 @@ func stddevPop(ranks []float64) float64 {
 }
 
 // lookupDigest fetches the *tdigest.TDigest inside m's *accumulator.CostDigest
-// stored under accumulator.CostDigestAttributeKey. Returns (nil, false) if
+// stored under accumulator.CostDigestAttributeKey. Returns nil if
 // ReadAttributeKey reports the attribute missing or of the wrong type;
-// callers treat !ok the same as an under-explored model.
+// callers treat nil the same as an under-explored model.
 //
 // Note: a nil inner Digest is unreachable here because ReadAttributeKey
 // returns a Clone of the stored value, and CostDigest.Clone dereferences
-// its inner Digest — any nil-inner state panics upstream before reaching
+// its inner Digest. Thus any nil-inner state panics upstream before reaching
 // this function.
 func lookupDigest(m datalayer.Model) *tdigest.TDigest {
 	cd, err := datalayer.ReadAttributeKey[*accumulator.CostDigest](m.GetAttributes(), accumulator.CostDigestAttributeKey)
