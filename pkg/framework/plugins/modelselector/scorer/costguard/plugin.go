@@ -197,8 +197,8 @@ func (s *CostGuardScorer) Score(_ context.Context, _ *plugin.CycleState, _ *requ
 	scores := make(map[datalayer.Model]float64, len(models))
 
 	// Partition by sampleThreshold; !ok from lookupDigest is treated as under-explored.
-	var explored []datalayer.Model
-	var digests []*tdigest.TDigest
+	explored := make([]datalayer.Model, 0, len(models))
+	digests := make([]*tdigest.TDigest, 0, len(models))
 	for _, m := range models {
 		d, ok := lookupDigest(m)
 		if !ok || d.Count() < s.sampleThreshold {
