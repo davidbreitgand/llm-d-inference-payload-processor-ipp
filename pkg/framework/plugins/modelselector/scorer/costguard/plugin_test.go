@@ -61,39 +61,55 @@ func modelWithDigest(t *testing.T, name string, cd *accumulator.CostDigest) data
 	return m
 }
 
-// TestScore_SingleExploredPlusUnderExplored verifies the len(explored) < 2
-// guard: with exactly one explored model there is no meaningful sigmoid to
-// compute, so every model (including the explored one) receives neutral.
-func TestScore_SingleExploredPlusUnderExplored(t *testing.T) {
+// TestScore_AllNeutral covers cases where Score should return neutral for
+// every input model:
+//   - "single-explored-plus-under-explored": the len(explored) < 2 guard —
+//     with one explored model there is no meaningful sigmoid to compute.
+//   - "identical-ranks": the sigma == 0 guard — when all explored models
+//     have identical rank the sigmoid degenerates.
+func TestScore_AllNeutral(t *testing.T) {
 	s := newTestScorer(t)
-	underCount := s.sampleThreshold - 1
-	overCount := s.sampleThreshold + 50
-	explored := modelWithDigest(t, "explored", newCostDigestN(t, 1.0, overCount))
-	under1 := modelWithDigest(t, "under1", newCostDigestN(t, 2.0, underCount))
-	under2 := modelWithDigest(t, "under2", newCostDigestN(t, 3.0, underCount))
-	models := []datalayer.Model{explored, under1, under2}
-	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
-	require.Len(t, scores, len(models))
-	for _, m := range models {
-		assert.Equal(t, neutralScore, scores[m])
-	}
-}
+	under := s.sampleThreshold - 1
+	over := s.sampleThreshold + 50
 
-// TestScore_IdenticalRanks verifies the sigma == 0 guard: when all explored
-// models have identical rank the sigmoid degenerates, so every explored
-// model falls back to neutral.
-func TestScore_IdenticalRanks(t *testing.T) {
-	s := newTestScorer(t)
-	overCount := s.sampleThreshold + 50
-	models := []datalayer.Model{
-		modelWithDigest(t, "m1", newCostDigestN(t, 5.0, overCount)),
-		modelWithDigest(t, "m2", newCostDigestN(t, 5.0, overCount)),
-		modelWithDigest(t, "m3", newCostDigestN(t, 5.0, overCount)),
+	type modelSpec struct {
+		name  string
+		cost  float64
+		count uint64
 	}
-	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
-	require.Len(t, scores, len(models))
-	for _, m := range models {
-		assert.Equal(t, neutralScore, scores[m])
+	tests := []struct {
+		name   string
+		models []modelSpec
+	}{
+		{
+			name: "single-explored-plus-under-explored",
+			models: []modelSpec{
+				{"explored", 1.0, over},
+				{"under1", 2.0, under},
+				{"under2", 3.0, under},
+			},
+		},
+		{
+			name: "identical-ranks",
+			models: []modelSpec{
+				{"m1", 5.0, over},
+				{"m2", 5.0, over},
+				{"m3", 5.0, over},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			models := make([]datalayer.Model, len(tt.models))
+			for i, spec := range tt.models {
+				models[i] = modelWithDigest(t, spec.name, newCostDigestN(t, spec.cost, spec.count))
+			}
+			scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+			require.Len(t, scores, len(models))
+			for _, m := range models {
+				assert.Equal(t, neutralScore, scores[m])
+			}
+		})
 	}
 }
 
@@ -203,78 +219,64 @@ func TestScore_SingleModelInput(t *testing.T) {
 	assert.Equal(t, neutralScore, scores[m])
 }
 
-// TestScore_MixedExploredAndUnderExplored verifies that each under-explored
-// variant coexists with two well-explored models: the under-explored model
-// scores neutral (via lookupDigest's !ok branches or the sampleThreshold
-// gate) and the two explored models are scored on the exploit path exactly
-// as they would be alone.
-func TestScore_MixedExploredAndUnderExplored(t *testing.T) {
+// TestScore_UnderExplored verifies the two paths that classify a model as
+// under-explored — the lookupDigest nil-digest branch (missing attribute)
+// and the sampleThreshold gate (count below threshold).
+// There are two contexts:
+//   - "alone": the under-explored model is the only input; the len(explored)
+//     < 2 guard collapses it to neutralScore.
+//   - "with-explored-pair": two well-explored models coexist with the
+//     under-explored one; the under-explored model still scores neutral,
+//     and the two explored models are scored on the exploit path exactly
+//     as they would be alone (symmetric around 0.5).
+func TestScore_UnderExplored(t *testing.T) {
 	s := newTestScorer(t)
-	overCount := s.sampleThreshold + 50
-	underCount := s.sampleThreshold - 1
+	over := s.sampleThreshold + 50
+	under := s.sampleThreshold - 1
 
-	tests := []struct {
+	underVariants := []struct {
 		name  string
-		under func(t *testing.T) datalayer.Model
+		build func(t *testing.T) datalayer.Model
 	}{
-		{
-			"count below sampleThreshold",
-			func(t *testing.T) datalayer.Model {
-				return modelWithDigest(t, "under", newCostDigestN(t, 2.0, underCount))
-			},
-		},
 		{
 			"missing cost_digest attribute",
 			func(t *testing.T) datalayer.Model { return datalayer.NewModel("under") },
 		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, overCount))
-			expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, overCount))
-			under := tt.under(t)
-			models := []datalayer.Model{cheap, expensive, under}
-			scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
-			require.Len(t, scores, len(models))
-			assert.Equal(t, neutralScore, scores[under])
-			assert.Greater(t, scores[cheap], 0.5)
-			assert.Less(t, scores[expensive], 0.5)
-			assert.InDelta(t, 1.0, scores[cheap]+scores[expensive], 1e-9)
-		})
-	}
-}
-
-// TestScore_UnderExploredCases verifies that every partition-loop path that
-// classifies a model as under-explored yields the neutral score. Exercises
-// each fixture helper at least once and pins the "!ok" branches of
-// lookupDigest plus the sampleThreshold gate.
-func TestScore_UnderExploredCases(t *testing.T) {
-	s := newTestScorer(t)
-	// s.sampleThreshold is 203 for the default scorer; feed something well below.
-	underCount := s.sampleThreshold - 1
-
-	tests := []struct {
-		name  string
-		model func(t *testing.T) datalayer.Model
-	}{
-		{
-			"missing cost_digest attribute",
-			func(t *testing.T) datalayer.Model { return datalayer.NewModel("m") },
-		},
 		{
 			"count below sampleThreshold",
 			func(t *testing.T) datalayer.Model {
-				return modelWithDigest(t, "m", newCostDigestN(t, 1.0, underCount))
+				return modelWithDigest(t, "under", newCostDigestN(t, 2.0, under))
 			},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			m := tt.model(t)
-			scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), []datalayer.Model{m})
-			require.Len(t, scores, 1)
-			assert.Equal(t, neutralScore, scores[m])
-		})
+	contexts := []struct {
+		name         string
+		withExplored bool
+	}{
+		{"alone", false},
+		{"with-explored-pair", true},
+	}
+	for _, uv := range underVariants {
+		for _, ctx := range contexts {
+			t.Run(uv.name+"/"+ctx.name, func(t *testing.T) {
+				u := uv.build(t)
+				models := []datalayer.Model{u}
+				var cheap, expensive datalayer.Model
+				if ctx.withExplored {
+					cheap = modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, over))
+					expensive = modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, over))
+					models = []datalayer.Model{cheap, expensive, u}
+				}
+				scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+				require.Len(t, scores, len(models))
+				assert.Equal(t, neutralScore, scores[u])
+				if ctx.withExplored {
+					assert.Greater(t, scores[cheap], 0.5)
+					assert.Less(t, scores[expensive], 0.5)
+					assert.InDelta(t, 1.0, scores[cheap]+scores[expensive], 1e-9)
+				}
+			})
+		}
 	}
 }
 
