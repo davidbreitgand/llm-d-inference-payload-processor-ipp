@@ -289,7 +289,7 @@ func stddevPop(ranks []float64) float64 {
 // returns a Clone of the stored value, and CostDigest.Clone dereferences
 // its inner Digest — any nil-inner state panics upstream before reaching
 // this function.
-func lookupDigest(m datalayer.Model) (*tdigest.TDigest, bool) {
+func lookupDigest(m datalayer.Model) *tdigest.TDigest, bool {
 	cd, err := datalayer.ReadAttributeKey[*accumulator.CostDigest](m.GetAttributes(), accumulator.CostDigestAttributeKey)
 	if err != nil {
 		return nil, false
