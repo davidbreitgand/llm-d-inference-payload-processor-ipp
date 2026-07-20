@@ -22,10 +22,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caio/go-tdigest/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/accumulator"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/plugin"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/requesthandling"
 )
@@ -37,6 +39,243 @@ func newTestScorer(t *testing.T) *CostGuardScorer {
 	s, ok := p.(*CostGuardScorer)
 	require.True(t, ok)
 	return s
+}
+
+// newCostDigestN builds a *accumulator.CostDigest containing n copies of v
+// (via AddWeighted). Used to cheaply cross the sampleThreshold in tests
+// that don't care about distribution shape.
+func newCostDigestN(t *testing.T, v float64, n uint64) *accumulator.CostDigest {
+	t.Helper()
+	d, err := tdigest.New()
+	require.NoError(t, err)
+	require.NoError(t, d.AddWeighted(v, n))
+	return &accumulator.CostDigest{Digest: d}
+}
+
+// modelWithDigest returns a Model whose AttributeMap holds cd under
+// CostDigestAttributeKey.
+func modelWithDigest(t *testing.T, name string, cd *accumulator.CostDigest) datalayer.Model {
+	t.Helper()
+	m := datalayer.NewModel(name)
+	m.GetAttributes().Put(accumulator.CostDigestAttributeKey, cd)
+	return m
+}
+
+// TestScore_SingleExploredPlusUnderExplored verifies the len(explored) < 2
+// guard: with exactly one explored model there is no meaningful sigmoid to
+// compute, so every model (including the explored one) receives neutral.
+func TestScore_SingleExploredPlusUnderExplored(t *testing.T) {
+	s := newTestScorer(t)
+	underCount := s.sampleThreshold - 1
+	overCount := s.sampleThreshold + 50
+	explored := modelWithDigest(t, "explored", newCostDigestN(t, 1.0, overCount))
+	under1 := modelWithDigest(t, "under1", newCostDigestN(t, 2.0, underCount))
+	under2 := modelWithDigest(t, "under2", newCostDigestN(t, 3.0, underCount))
+	models := []datalayer.Model{explored, under1, under2}
+	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+	require.Len(t, scores, len(models))
+	for _, m := range models {
+		assert.Equal(t, neutralScore, scores[m])
+	}
+}
+
+// TestScore_IdenticalRanks verifies the sigma == 0 guard: when all explored
+// models have identical rank the sigmoid degenerates, so every explored
+// model falls back to neutral.
+func TestScore_IdenticalRanks(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+	models := []datalayer.Model{
+		modelWithDigest(t, "m1", newCostDigestN(t, 5.0, overCount)),
+		modelWithDigest(t, "m2", newCostDigestN(t, 5.0, overCount)),
+		modelWithDigest(t, "m3", newCostDigestN(t, 5.0, overCount)),
+	}
+	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+	require.Len(t, scores, len(models))
+	for _, m := range models {
+		assert.Equal(t, neutralScore, scores[m])
+	}
+}
+
+// TestScore_TwoDistinctRanks verifies the two-model exploit path: the
+// cheaper model scores above 0.5, the more expensive below, and the two
+// scores are symmetric around 0.5 (sum to 1.0).
+func TestScore_TwoDistinctRanks(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+	cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, overCount))
+	expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, overCount))
+	models := []datalayer.Model{cheap, expensive}
+	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+	require.Len(t, scores, len(models))
+	assert.Greater(t, scores[cheap], 0.5, "cheaper model should score above neutral")
+	assert.Less(t, scores[expensive], 0.5, "more expensive model should score below neutral")
+	// Algebraic identity: with n=2 the ranks straddle the median symmetrically,
+	// so the sigmoid arguments are equal-and-opposite. sigmoid(x)+sigmoid(-x)=1
+	// for any x (1/(1+e^x)+1/(1+e^-x)=1), so the sum is exactly 1.
+	assert.InDelta(t, 1.0, scores[cheap]+scores[expensive], 1e-9, "two-model scores must be symmetric around 0.5 by construction")
+}
+
+// TestScore_ThreeDistinctRanks verifies the three-model exploit path:
+// - the median-rank model scores exactly 0.5 (sigmoid(0)),
+// - the cheapest scores highest and above the median-rank model,
+// - the most expensive scores lowest and below the median-rank model.
+// The symmetric-outer-scores property is covered by TestScore_TwoDistinctRanks.
+func TestScore_ThreeDistinctRanks(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+	cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, overCount))
+	mid := modelWithDigest(t, "mid", newCostDigestN(t, 2.0, overCount))
+	expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, overCount))
+	models := []datalayer.Model{cheap, mid, expensive}
+	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+	require.Len(t, scores, len(models))
+	assert.InDelta(t, 0.5, scores[mid], 1e-9, "median-rank model should score exactly neutral")
+	assert.Greater(t, scores[cheap], scores[mid])
+	assert.Less(t, scores[expensive], scores[mid])
+}
+
+// TestScore_SelfCalibratesToScale asserts that the sigmoid is invariant
+// under uniform scaling of the ranks. Two fixtures with the same relative
+// geometry but wildly different absolute scale — costs (1, 2, 3) versus
+// (1000, 2000, 3000) — must produce identical score distributions.
+//
+// This pins the beta = 1/stddevPop calibration: the score function depends
+// only on each rank's normalised distance from the median, not on absolute scale.
+func TestScore_SelfCalibratesToScale(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+
+	// Small-scale fixture.
+	smallCheap := modelWithDigest(t, "small-cheap", newCostDigestN(t, 1.0, overCount))
+	smallMid := modelWithDigest(t, "small-mid", newCostDigestN(t, 2.0, overCount))
+	smallExpensive := modelWithDigest(t, "small-expensive", newCostDigestN(t, 3.0, overCount))
+	smallScores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(),
+		[]datalayer.Model{smallCheap, smallMid, smallExpensive})
+
+	// Large-scale fixture — same relative geometry, costs scaled by 1000.
+	largeCheap := modelWithDigest(t, "large-cheap", newCostDigestN(t, 1000.0, overCount))
+	largeMid := modelWithDigest(t, "large-mid", newCostDigestN(t, 2000.0, overCount))
+	largeExpensive := modelWithDigest(t, "large-expensive", newCostDigestN(t, 3000.0, overCount))
+	largeScores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(),
+		[]datalayer.Model{largeCheap, largeMid, largeExpensive})
+
+	assert.InDelta(t, smallScores[smallCheap], largeScores[largeCheap], 1e-9)
+	assert.InDelta(t, smallScores[smallMid], largeScores[largeMid], 1e-9)
+	assert.InDelta(t, smallScores[smallExpensive], largeScores[largeExpensive], 1e-9)
+}
+
+// TestScore_UnevenSpread asserts that when one rank is a far outlier, its
+// score saturates near the sigmoid extreme while the inner ranks stay near
+// neutral. Fixture costs (1.0, 2.0, 100.0) put the expensive model at ~49x
+// the distance from the median compared to the cheap model, so its
+// normalised beta*(rank - median) is deep in the sigmoid tail.
+//
+// This complements TestScore_SelfCalibratesToScale by pinning geometry-
+// dependent behavior: the shape of the score distribution reflects the
+// relative geometry of the ranks, even though it is invariant to scale.
+func TestScore_UnevenSpread(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+	cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, overCount))
+	mid := modelWithDigest(t, "mid", newCostDigestN(t, 2.0, overCount))
+	expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 100.0, overCount))
+	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(),
+		[]datalayer.Model{cheap, mid, expensive})
+	require.Len(t, scores, 3)
+	assert.InDelta(t, 0.5, scores[mid], 1e-9, "median-rank model still scores exactly neutral")
+	assert.Greater(t, scores[cheap], scores[mid], "cheap ranks below median so scores above neutral")
+	assert.Less(t, scores[expensive], 0.15, "expensive is a far outlier and saturates the sigmoid tail")
+	assert.Less(t, scores[cheap], 0.55, "cheap is only slightly below median so its score barely exceeds neutral")
+}
+
+// TestScore_SingleModelInput asserts that Score handles a single-element
+// models slice: len(scores) == 1 and the sole model receives neutralScore
+// via the len(explored) < 2 guard, regardless of whether it has a valid
+// well-explored digest.
+func TestScore_SingleModelInput(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+	m := modelWithDigest(t, "only", newCostDigestN(t, 42.0, overCount))
+	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(),
+		[]datalayer.Model{m})
+	require.Len(t, scores, 1)
+	assert.Equal(t, neutralScore, scores[m])
+}
+
+// TestScore_MixedExploredAndUnderExplored verifies that each under-explored
+// variant coexists with two well-explored models: the under-explored model
+// scores neutral (via lookupDigest's !ok branches or the sampleThreshold
+// gate) and the two explored models are scored on the exploit path exactly
+// as they would be alone.
+func TestScore_MixedExploredAndUnderExplored(t *testing.T) {
+	s := newTestScorer(t)
+	overCount := s.sampleThreshold + 50
+	underCount := s.sampleThreshold - 1
+
+	tests := []struct {
+		name  string
+		under func(t *testing.T) datalayer.Model
+	}{
+		{
+			"count below sampleThreshold",
+			func(t *testing.T) datalayer.Model {
+				return modelWithDigest(t, "under", newCostDigestN(t, 2.0, underCount))
+			},
+		},
+		{
+			"missing cost_digest attribute",
+			func(t *testing.T) datalayer.Model { return datalayer.NewModel("under") },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, overCount))
+			expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, overCount))
+			under := tt.under(t)
+			models := []datalayer.Model{cheap, expensive, under}
+			scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+			require.Len(t, scores, len(models))
+			assert.Equal(t, neutralScore, scores[under])
+			assert.Greater(t, scores[cheap], 0.5)
+			assert.Less(t, scores[expensive], 0.5)
+			assert.InDelta(t, 1.0, scores[cheap]+scores[expensive], 1e-9)
+		})
+	}
+}
+
+// TestScore_UnderExploredCases verifies that every partition-loop path that
+// classifies a model as under-explored yields the neutral score. Exercises
+// each fixture helper at least once and pins the "!ok" branches of
+// lookupDigest plus the sampleThreshold gate.
+func TestScore_UnderExploredCases(t *testing.T) {
+	s := newTestScorer(t)
+	// s.sampleThreshold is 203 for the default scorer; feed something well below.
+	underCount := s.sampleThreshold - 1
+
+	tests := []struct {
+		name  string
+		model func(t *testing.T) datalayer.Model
+	}{
+		{
+			"missing cost_digest attribute",
+			func(t *testing.T) datalayer.Model { return datalayer.NewModel("m") },
+		},
+		{
+			"count below sampleThreshold",
+			func(t *testing.T) datalayer.Model {
+				return modelWithDigest(t, "m", newCostDigestN(t, 1.0, underCount))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := tt.model(t)
+			scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), []datalayer.Model{m})
+			require.Len(t, scores, 1)
+			assert.Equal(t, neutralScore, scores[m])
+		})
+	}
 }
 
 // TestFactory_DefaultConfig verifies factory behavior with nil parameters and
@@ -59,7 +298,8 @@ func TestFactory_DefaultConfig(t *testing.T) {
 			assert.Equal(t, defaultAlpha, s.alpha)
 			assert.Equal(t, defaultLambda, s.lambda)
 			assert.Equal(t, 2*time.Hour, s.windowDuration)
-			assert.Equal(t, sampleThreshold(defaultAlpha, defaultPercentileMarginError), s.sampleThreshold)
+			// Wald CI at defaults (alpha=0.95, w=0.03) — see README table.
+			assert.Equal(t, uint64(203), s.sampleThreshold)
 			assert.Equal(t, PluginType, s.TypedName().Type)
 			assert.Equal(t, "test-cg", s.TypedName().Name)
 		})
@@ -76,7 +316,8 @@ func TestFactory_CustomConfig(t *testing.T) {
 	assert.Equal(t, 0.9, s.alpha)
 	assert.Equal(t, 2.0, s.lambda)
 	assert.Equal(t, 30*time.Minute, s.windowDuration)
-	assert.Equal(t, sampleThreshold(0.9, 0.05), s.sampleThreshold)
+	// Wald CI at alpha=0.9, w=0.05: ceil(1.96^2 * 0.09 / 0.0025) = 139.
+	assert.Equal(t, uint64(139), s.sampleThreshold)
 }
 
 // TestFactory_ValidationErrors verifies that each out-of-range or malformed
@@ -131,6 +372,19 @@ func TestFactory_AcceptedBoundaries(t *testing.T) {
 			`{"lambda":0}`,
 			func(t *testing.T, s *CostGuardScorer) { assert.Equal(t, 0.0, s.lambda) },
 		},
+		{
+			"alpha just inside strict (0, 1)",
+			`{"alpha":0.01}`,
+			func(t *testing.T, s *CostGuardScorer) { assert.Equal(t, 0.01, s.alpha) },
+		},
+		{
+			"percentileMarginError just inside strict (0, 1)",
+			`{"percentileMarginError":0.01}`,
+			func(t *testing.T, s *CostGuardScorer) {
+				// Formula stays well-defined at the small end.
+				assert.Greater(t, s.sampleThreshold, uint64(0))
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -152,26 +406,29 @@ func TestWithName(t *testing.T) {
 
 // --- Helper tests ---
 
-// TestSampleThreshold verifies the Wald CI sample-size formula against the
-// values documented in the CostGuard README.
-func TestSampleThreshold(t *testing.T) {
-	assert.Equal(t, uint64(203), sampleThreshold(0.95, 0.03))
-	assert.Equal(t, uint64(73), sampleThreshold(0.95, 0.05))
-}
-
-// --- Score tests (PR 1 stub returns neutral for every model) ---
-
-func TestScore_AllNeutral(t *testing.T) {
-	s := newTestScorer(t)
-	models := []datalayer.Model{
-		datalayer.NewModel("m1"),
-		datalayer.NewModel("m2"),
-		datalayer.NewModel("m3"),
+// TestMedian verifies median across the branch matrix: odd-length picks
+// the middle element, even-length averages the two middle elements,
+// single-element returns itself, and unsorted input is sorted internally
+// (verifying the slices.Clone + sort.Float64s contract).
+func TestMedian(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []float64
+		want float64
+	}{
+		{"single element", []float64{5}, 5},
+		{"odd length sorted", []float64{1, 2, 3}, 2},
+		{"even length sorted", []float64{1, 2, 3, 4}, 2.5},
+		{"unsorted input", []float64{3, 1, 2}, 2},
+		{"odd length with duplicates", []float64{7, 7, 7, 7, 7}, 7},
 	}
-	scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
-	require.Len(t, scores, len(models))
-	for _, m := range models {
-		assert.Equal(t, neutralScore, scores[m], "model %s expected neutralScore", m.GetName())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Snapshot input to verify the slice is not mutated.
+			original := append([]float64(nil), tt.in...)
+			assert.InDelta(t, tt.want, median(tt.in), 1e-9)
+			assert.Equal(t, original, tt.in, "median must not mutate its input")
+		})
 	}
 }
 

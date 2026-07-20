@@ -15,11 +15,13 @@ limitations under the License.
 */
 
 // Package costguard implements a cost-minimising scorer for the ModelSelector
-// framework. It routes inference to the model with the lowest observed cost
-// via an epsilon-Greedy Multi-Arm Bandit, using a risk-aware rank that
-// combines each model's body cost (trimmed mean) and Conditional Tail
-// Expectation of the cost distribution. See the package README.md file for the full
-// algorithm and configuration reference.
+// framework. It routes inference to the model with the lowest observed cost,
+// using a risk-aware rank that combines each model's body cost (trimmed
+// mean) and Conditional Tail Expectation of the cost distribution. The full
+// design targets an epsilon-Greedy Multi-Arm Bandit — the exploit branch
+// (rank + self-calibrating sigmoid) is implemented today; the explore
+// branch and per-epoch windowing land in follow-up PRs. See the package
+// README.md file for the full algorithm and configuration reference.
 package costguard
 
 import (
@@ -27,9 +29,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
+	"sort"
 	"time"
 
+	"github.com/caio/go-tdigest/v5"
+
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer"
+	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/datalayer/accumulator"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/modelselector"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/plugin"
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/requesthandling"
@@ -39,9 +46,7 @@ const (
 	// PluginType is the identifier used when registering this scorer.
 	PluginType = "costguard"
 
-	// z95 is the standard normal quantile for a 95% confidence interval, used
-	// in sampleThreshold to derive the per-model minimum sample size from the
-	// configured percentile margin of error.
+	// z95 is the standard-normal 95% quantile used in sampleThreshold.
 	z95 = 1.96
 
 	// neutralScore is returned for any model that the scorer has no strong opinion
@@ -63,9 +68,11 @@ var _ modelselector.Scorer = &CostGuardScorer{}
 // Config defines the JSON configuration for the plugin. All fields have
 // sensible defaults, so an empty config is valid.
 type Config struct {
-	// Epsilon is the probability of random exploration on each request. Must
-	// be in [0, 1]. Defaults to 0.1. Setting Epsilon to 1.0 forces full random
-	// selection (with replacement) on every request.
+	// Epsilon is the probability of random exploration per request. Must be
+	// in [0, 1]. Defaults to 0.1.
+	//
+	// TODO(costguard-explore): parsed and validated today, not consulted at
+	// scoring time. The exploration branch lands in a follow-up PR.
 	Epsilon float64 `json:"epsilon"`
 
 	// Alpha is the quantile that separates the body of the cost distribution
@@ -76,41 +83,39 @@ type Config struct {
 	// (Conditional Tail Expectation). Must be >= 0. Defaults to 1.0.
 	Lambda float64 `json:"lambda"`
 
-	// WindowDuration is the epoch length. Parsed as a Go duration string
-	// (e.g. "2h", "30m"). Must be > 0. Defaults to "2h".
+	// WindowDuration is the epoch length as a Go duration string (e.g. "2h").
+	// Must be > 0. Defaults to "2h".
 	//
-	// TODO: costguard-epoch: consume in the final PR for costguard epoch.
-	// Parsed and validated today, but not consulted at scoring time.
-	// The requestcostmetadata extractor plugin will own the window
-	// in the concluding PR for CostGuard.
+	// TODO(costguard-epoch): parsed today, not used at scoring; the
+	// requestcostmetadata extractor will own the window in a follow-up PR.
 	WindowDuration string `json:"windowDuration"`
 
-	// PercentileMarginError is the error around the alpha-quantile
-	// of the observed cost distribution. Must be in (0, 1).
-	// Defaults to 0.03. Smaller values require quadratically more
-	// samples to consider a model sufficiently explored.
+	// PercentileMarginError (w) controls how tightly the empirical alpha-
+	// percentile threshold captures the true probability mass. With the
+	// defaults (alpha=0.95, w=0.03), at 95% confidence the observed p95
+	// threshold covers true probability mass in [alpha-w, alpha+w] — i.e.
+	// falls between p92 and p98 of the underlying distribution.
+	// Defaults to 0.03. Smaller values require quadratically more samples.
 	PercentileMarginError float64 `json:"percentileMarginError"`
 }
 
-// CostGuardScorer will consume per-model cost samples via the datalayer
-// (published by the requestcostmetadata extractor) and score candidate models
-// to minimize typical cost and risk of the high cost in the tail.
-// See README.md for a description of how it works.
-//
-// At this time only the configuration surface, plugin registration, and a stub
-// scorer that returns a neutral score for every model exists.
+// CostGuardScorer consumes per-model cost samples (published by the
+// requestcostmetadata extractor) and scores candidate models to minimise
+// typical cost and the risk of expensive-tail responses.
 type CostGuardScorer struct {
-	typedName       plugin.TypedName
-	epsilon         float64
-	alpha           float64
-	lambda          float64
+	typedName plugin.TypedName
+	epsilon   float64
+	alpha     float64
+	lambda    float64
+	// sampleThreshold is the minimum sample count for the empirical
+	// alpha-percentile threshold to cover the true probability mass to within
+	// +/-percentileMarginError at a 95% confidence level, derived from the
+	// Wald margin-of-error formula for a proportion.
 	sampleThreshold uint64
 	windowDuration  time.Duration
 }
 
-// ScorerFactory creates a CostGuardScorer from the given raw parameters.
-// It validates every field of Config and precomputes the sample threshold so
-// Score can rank candidate models with high statistical fidelity.
+// ScorerFactory validates rawParameters into a Config and constructs a scorer.
 func ScorerFactory(name string, rawParameters json.RawMessage, _ plugin.Handle) (plugin.Plugin, error) {
 	config := Config{
 		Epsilon:               defaultEpsilon,
@@ -154,17 +159,17 @@ func ScorerFactory(name string, rawParameters json.RawMessage, _ plugin.Handle) 
 	).WithName(name), nil
 }
 
-// NewCostGuardScorer constructs a scorer with the given parameters.
-// It performs no range checks; callers are responsible for passing values in
-// the ranges documented on Config.
-// ScorerFactory is the intended path for validated construction from raw JSON parameters.
+// NewCostGuardScorer constructs a scorer with the given parameters. No
+// validation — prefer ScorerFactory for JSON-configured construction.
 func NewCostGuardScorer(epsilon, alpha, lambda float64, windowDuration time.Duration, percentileMarginError float64) *CostGuardScorer {
+	// Wald CI sample-size formula
+	threshold := uint64(math.Ceil(z95 * z95 * alpha * (1 - alpha) / (percentileMarginError * percentileMarginError)))
 	return &CostGuardScorer{
 		typedName:       plugin.TypedName{Type: PluginType, Name: PluginType},
 		epsilon:         epsilon,
 		alpha:           alpha,
 		lambda:          lambda,
-		sampleThreshold: sampleThreshold(alpha, percentileMarginError),
+		sampleThreshold: threshold,
 		windowDuration:  windowDuration,
 	}
 }
@@ -180,18 +185,114 @@ func (s *CostGuardScorer) WithName(name string) *CostGuardScorer {
 	return s
 }
 
-// Score returns the neutral score for every model. The exploit and explore
-// branches follow in subsequent PRs.
+// Score returns a score in [0, 1] per model. Explored models are ranked as
+// TrimmedMean(0, alpha) + lambda*CTE(alpha), where CTE is the discrete
+// Conditional Tail Expectation (tail mean above alpha). Under-explored,
+// missing, or malformed digests yield neutralScore. Ranks map to scores via
+// a sigmoid centred at the median.
 func (s *CostGuardScorer) Score(_ context.Context, _ *plugin.CycleState, _ *requesthandling.InferenceRequest, models []datalayer.Model) map[datalayer.Model]float64 {
+	if len(models) == 0 {
+		return map[datalayer.Model]float64{}
+	}
 	scores := make(map[datalayer.Model]float64, len(models))
+
+	// Partition by sampleThreshold; !ok from lookupDigest is treated as under-explored.
+	var explored []datalayer.Model
+	var digests []*tdigest.TDigest
 	for _, m := range models {
-		scores[m] = neutralScore
+		d, ok := lookupDigest(m)
+		if !ok || d.Count() < s.sampleThreshold {
+			scores[m] = neutralScore
+			continue
+		}
+		explored = append(explored, m)
+		digests = append(digests, d)
+	}
+
+	// Need >= 2 explored to compute a sigmoid; otherwise every model is neutral.
+	if len(explored) < 2 {
+		for _, m := range explored {
+			scores[m] = neutralScore
+		}
+		return scores
+	}
+
+	// Rank = TrimmedMean(0, alpha) + lambda * TrimmedMean(alpha, 1). The tail
+	// term is the discrete Conditional Tail Expectation (CTE). Lower rank is better.
+	ranks := make([]float64, len(explored))
+	for i, d := range digests {
+		body := d.TrimmedMean(0, s.alpha)
+		tail := d.TrimmedMean(s.alpha, 1)
+		ranks[i] = body + s.lambda*tail
+	}
+
+	// Self-calibrating sigmoid; identical ranks (sigma == 0) collapse to neutral.
+	med := median(ranks)
+	sigma := stddevPop(ranks)
+	if sigma == 0 {
+		for _, m := range explored {
+			scores[m] = neutralScore
+		}
+		return scores
+	}
+	beta := 1 / sigma
+	for i, m := range explored {
+		scores[m] = sigmoid(beta * (ranks[i] - med))
 	}
 	return scores
 }
 
-// sampleThreshold returns the minimum sample count for a model's alpha-quantile
-// estimate to have a two-sided 95% CI of half-width w (Wald formula).
-func sampleThreshold(alpha, w float64) uint64 {
-	return uint64(math.Ceil(z95 * z95 * alpha * (1 - alpha) / (w * w)))
+// sigmoid maps a centred rank to a score in (0, 1). Sign is negated inline
+// (1/(1+exp(x)) == 1/(1+exp(-(-x)))) so that lower rank yields a higher score.
+func sigmoid(x float64) float64 {
+	return 1 / (1 + math.Exp(x))
+}
+
+// median returns the median of ranks. Precondition: len(ranks) > 0.
+// The input slice is not mutated.
+func median(ranks []float64) float64 {
+	c := slices.Clone(ranks)
+	sort.Float64s(c)
+	n := len(c)
+	if n%2 == 1 {
+		return c[n/2]
+	}
+	return (c[n/2-1] + c[n/2]) / 2
+}
+
+// stddevPop returns the population standard deviation of ranks (divisor N).
+// Ranks enumerate every candidate model in the current scoring call, so the
+// set is the population. Returns 0 when len(ranks) < 2.
+func stddevPop(ranks []float64) float64 {
+	if len(ranks) < 2 {
+		return 0
+	}
+	var mean float64
+	for _, v := range ranks {
+		mean += v
+	}
+	mean /= float64(len(ranks))
+	var ss float64
+	for _, v := range ranks {
+		diff := v - mean
+		ss += diff * diff
+	}
+	return math.Sqrt(ss / float64(len(ranks)))
+}
+
+// lookupDigest fetches the *tdigest.TDigest inside m's *accumulator.CostDigest
+// stored under accumulator.CostDigestAttributeKey. Returns (nil, false) if
+// ReadAttributeKey reports the attribute missing or of the wrong type;
+// callers treat !ok the same as an under-explored model.
+//
+// Note: a nil inner Digest is unreachable here because ReadAttributeKey
+// returns a Clone of the stored value, and CostDigest.Clone dereferences
+// its inner Digest — any nil-inner state panics upstream before reaching
+// this function.
+func lookupDigest(m datalayer.Model) (*tdigest.TDigest, bool) {
+	cd, err := datalayer.ReadAttributeKey[*accumulator.CostDigest](m.GetAttributes(), accumulator.CostDigestAttributeKey)
+	if err != nil {
+		return nil, false
+	}
+	return cd.Digest, true
 }
