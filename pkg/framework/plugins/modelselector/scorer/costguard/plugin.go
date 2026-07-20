@@ -196,12 +196,12 @@ func (s *CostGuardScorer) Score(_ context.Context, _ *plugin.CycleState, _ *requ
 	}
 	scores := make(map[datalayer.Model]float64, len(models))
 
-	// Partition by sampleThreshold; !ok from lookupDigest is treated as under-explored.
+	// Partition by sampleThreshold; a nil digest is treated as under-explored.
 	explored := make([]datalayer.Model, 0, len(models))
 	digests := make([]*tdigest.TDigest, 0, len(models))
 	for _, m := range models {
-		d, ok := lookupDigest(m)
-		if !ok || d.Count() < s.sampleThreshold {
+		d := lookupDigest(m)
+		if d == nil || d.Count() < s.sampleThreshold {
 			scores[m] = neutralScore
 			continue
 		}
@@ -289,7 +289,7 @@ func stddevPop(ranks []float64) float64 {
 // returns a Clone of the stored value, and CostDigest.Clone dereferences
 // its inner Digest — any nil-inner state panics upstream before reaching
 // this function.
-func lookupDigest(m datalayer.Model) *tdigest.TDigest, bool {
+func lookupDigest(m datalayer.Model) *tdigest.TDigest {
 	cd, err := datalayer.ReadAttributeKey[*accumulator.CostDigest](m.GetAttributes(), accumulator.CostDigestAttributeKey)
 	if err != nil {
 		return nil
