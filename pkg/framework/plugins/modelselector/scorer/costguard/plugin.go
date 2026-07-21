@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"slices"
 	"sort"
 	"time"
@@ -68,11 +69,10 @@ var _ modelselector.Scorer = &CostGuardScorer{}
 // Config defines the JSON configuration for the plugin. All fields have
 // sensible defaults, so an empty config is valid.
 type Config struct {
-	// Epsilon is the probability of random exploration per request. Must be
+	// Epsilon is the probability of random exploration per request: with
+	// probability epsilon Score picks uniformly (preferring under-explored
+	// models when any exist) instead of ranking on the cost digests. Must be
 	// in [0, 1]. Defaults to 0.1.
-	//
-	// TODO(costguard-explore): parsed and validated today, not consulted at
-	// scoring time. The exploration branch lands in a follow-up PR.
 	Epsilon float64 `json:"epsilon"`
 
 	// Alpha is the quantile that separates the body of the cost distribution
@@ -185,7 +185,10 @@ func (s *CostGuardScorer) WithName(name string) *CostGuardScorer {
 	return s
 }
 
-// Score returns a score in [0, 1] per model. Explored models are ranked as
+// Score returns a score in [0, 1] per model. With probability epsilon Score
+// takes the explore branch (uniform pick, preferring under-explored models
+// when any exist; the pick receives 1.0, everything else neutralScore).
+// Otherwise it takes the exploit branch: explored models are ranked as
 // TrimmedMean(0, alpha) + lambda*CTE(alpha), where CTE is the discrete
 // Conditional Tail Expectation (tail mean above alpha). Under-explored,
 // missing, or malformed digests yield neutralScore. Ranks map to scores via
@@ -194,6 +197,17 @@ func (s *CostGuardScorer) Score(_ context.Context, _ *plugin.CycleState, _ *requ
 	if len(models) == 0 {
 		return map[datalayer.Model]float64{}
 	}
+	if rand.Float64() < s.epsilon {
+		return s.explore(models)
+	}
+	return s.exploit(models)
+}
+
+// exploit ranks explored models by TrimmedMean + lambda*CTE and maps ranks
+// through a self-calibrating sigmoid centred at the median. Under-explored
+// models and every model in a degenerate configuration (fewer than two
+// explored models, or all identical ranks) receive neutralScore.
+func (s *CostGuardScorer) exploit(models []datalayer.Model) map[datalayer.Model]float64 {
 	scores := make(map[datalayer.Model]float64, len(models))
 
 	// Partition by sampleThreshold; a nil digest is treated as under-explored.
@@ -239,6 +253,31 @@ func (s *CostGuardScorer) Score(_ context.Context, _ *plugin.CycleState, _ *requ
 	for i, m := range explored {
 		scores[m] = sigmoid(beta * (ranks[i] - med))
 	}
+	return scores
+}
+
+// explore picks one model uniformly at random and gives it score 1.0; every
+// other model receives neutralScore. If under-explored models (nil digest or
+// count below sampleThreshold) exist, they are preferred.
+// When every model is explored, the candidate pool becomes all models.
+func (s *CostGuardScorer) explore(models []datalayer.Model) map[datalayer.Model]float64 {
+	underExplored := make([]datalayer.Model, 0, len(models))
+	for _, m := range models {
+		d := lookupDigest(m)
+		if d == nil || d.Count() < s.sampleThreshold {
+			underExplored = append(underExplored, m)
+		}
+	}
+	if len(underExplored) == 0 {
+		underExplored = models
+	}
+	pick := underExplored[rand.IntN(len(underExplored))]
+
+	scores := make(map[datalayer.Model]float64, len(models))
+	for _, m := range models {
+		scores[m] = neutralScore
+	}
+	scores[pick] = 1.0
 	return scores
 }
 

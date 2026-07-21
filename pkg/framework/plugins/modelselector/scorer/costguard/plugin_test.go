@@ -32,12 +32,17 @@ import (
 	"github.com/llm-d/llm-d-inference-payload-processor/pkg/framework/interface/requesthandling"
 )
 
+// newTestScorer builds a CostGuardScorer with defaults and pins epsilon
+// to 0, so Score deterministically takes the exploit branch. Explore-branch
+// tests should mutate s.epsilon after construction (or build their own
+// scorer) rather than call this one.
 func newTestScorer(t *testing.T) *CostGuardScorer {
 	t.Helper()
 	p, err := ScorerFactory("test-cg", nil, nil)
 	require.NoError(t, err)
 	s, ok := p.(*CostGuardScorer)
 	require.True(t, ok)
+	s.epsilon = 0
 	return s
 }
 
@@ -429,3 +434,112 @@ func TestMedian(t *testing.T) {
 	}
 }
 
+// TestScore_Explore verifies the epsilon=1 explore branch across the three
+// exploration-relevant trajectories. Each subtest runs 500 trials.
+//
+// Trials numnber rationale: with a 4-model uniform pick, the probability
+// that any given model is *never* selected across K trials is (3/4)^K.
+// At K=500 that is approximately 3^-63 per model, which is well below
+// any conceivable threshold.
+func TestScore_Explore(t *testing.T) {
+	const trials = 500
+
+	tests := []struct {
+		name string
+		// build returns (models, expectedPickPool). expectedPickPool is the
+		// set of models the explore branch is allowed to pick; every trial's
+		// 1.0-scored model must be in this pool, and the pool's coverage set
+		// must be observed exhaustively across `trials` runs.
+		build func(t *testing.T, s *CostGuardScorer) (models []datalayer.Model, expectedPickPool []datalayer.Model)
+	}{
+		{
+			name: "all-under-explored",
+			build: func(t *testing.T, s *CostGuardScorer) ([]datalayer.Model, []datalayer.Model) {
+				under := s.sampleThreshold - 1
+				a := modelWithDigest(t, "a", newCostDigestN(t, 1.0, under))
+				b := modelWithDigest(t, "b", newCostDigestN(t, 2.0, under))
+				c := modelWithDigest(t, "c", newCostDigestN(t, 3.0, under))
+				d := datalayer.NewModel("d") // missing digest — also under-explored
+				models := []datalayer.Model{a, b, c, d}
+				return models, models
+			},
+		},
+		{
+			name: "mixed-only-under-explored-selectable",
+			build: func(t *testing.T, s *CostGuardScorer) ([]datalayer.Model, []datalayer.Model) {
+				under := s.sampleThreshold - 1
+				over := s.sampleThreshold + 50
+				cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, over))
+				expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, over))
+				u1 := modelWithDigest(t, "u1", newCostDigestN(t, 2.0, under))
+				u2 := datalayer.NewModel("u2")
+				return []datalayer.Model{cheap, expensive, u1, u2}, []datalayer.Model{u1, u2}
+			},
+		},
+		{
+			name: "all-explored",
+			build: func(t *testing.T, s *CostGuardScorer) ([]datalayer.Model, []datalayer.Model) {
+				over := s.sampleThreshold + 50
+				a := modelWithDigest(t, "a", newCostDigestN(t, 1.0, over))
+				b := modelWithDigest(t, "b", newCostDigestN(t, 2.0, over))
+				c := modelWithDigest(t, "c", newCostDigestN(t, 3.0, over))
+				d := modelWithDigest(t, "d", newCostDigestN(t, 4.0, over))
+				models := []datalayer.Model{a, b, c, d}
+				return models, models
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestScorer(t)
+			s.epsilon = 1 // force the explore branch every call
+			models, pool := tt.build(t, s)
+			poolSet := make(map[datalayer.Model]struct{}, len(pool))
+			for _, m := range pool {
+				poolSet[m] = struct{}{}
+			}
+			observed := make(map[datalayer.Model]struct{}, len(pool))
+			for i := 0; i < trials; i++ {
+				scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+				require.Len(t, scores, len(models))
+				var pick datalayer.Model
+				pickCount := 0
+				for m, v := range scores {
+					if v == 1.0 {
+						pick = m
+						pickCount++
+					} else {
+						assert.Equal(t, neutralScore, v, "non-selected models must score neutral")
+					}
+				}
+				require.Equal(t, 1, pickCount, "exactly one model must be selected per trial")
+				_, ok := poolSet[pick]
+				assert.True(t, ok, "selected model must come from the expected pool")
+				observed[pick] = struct{}{}
+			}
+			assert.Len(t, observed, len(poolSet), "every model in the expected pool must be selected at least once across trials")
+		})
+	}
+}
+
+// TestScore_ExploitPathUnchanged verifies that with epsilon=0 the explore
+// branch never fires
+func TestScore_ExploitPathUnchanged(t *testing.T) {
+	const trials = 500
+	s := newTestScorer(t) // already pinned to epsilon=0
+	over := s.sampleThreshold + 50
+	under := s.sampleThreshold - 1
+	cheap := modelWithDigest(t, "cheap", newCostDigestN(t, 1.0, over))
+	expensive := modelWithDigest(t, "expensive", newCostDigestN(t, 3.0, over))
+	u := modelWithDigest(t, "under", newCostDigestN(t, 2.0, under))
+	models := []datalayer.Model{cheap, expensive, u}
+
+	for i := 0; i < trials; i++ {
+		scores := s.Score(context.Background(), plugin.NewCycleState(), requesthandling.NewInferenceRequest(), models)
+		require.Len(t, scores, len(models))
+		assert.Equal(t, neutralScore, scores[u], "under-explored model must remain neutral on the exploit path")
+		assert.Greater(t, scores[cheap], 0.5, "cheap model scores above neutral")
+		assert.Less(t, scores[expensive], 0.5, "expensive model scores below neutral")
+		assert.InDelta(t, 1.0, scores[cheap]+scores[expensive], 1e-9, "exploit-path symmetry identity holds every call")
+	}
+}
